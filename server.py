@@ -41,7 +41,9 @@ mcp = MCPServer(
     "offsec-mcp",
     instructions=(
         "Free, local-first subdomain enumeration and recon toolkit. "
-        "Wraps ProjectDiscovery (subfinder, httpx, dnsx, nuclei) and OWASP Amass. "
+        "Combines 8 passive sources (subfinder, crt.sh, AlienVault OTX, "
+        "Wayback, and more) with an active httpx brute-force pass that uses a "
+        "real browser User-Agent to see through Vercel/Cloudflare bot-walls. "
         "Falls back to crt.sh / pure Python when binaries are missing. "
         "Use only against domains you own or have written authorization to test."
     ),
@@ -86,12 +88,18 @@ def _to_list(value) -> list[str]:
 
 @mcp.tool()
 def enumerate_subdomains(domain: str) -> dict:
-    """Enumerate subdomains for a target domain using subfinder + amass.
+    """Enumerate subdomains for a target domain.
+
+    Runs 8 passive intelligence sources in parallel, then an active httpx
+    brute-force pass (curated service wordlist + wildcard-noise filtering),
+    then a Wayback link-crawl. Uses a real browser User-Agent so hosts behind
+    Vercel/Cloudflare bot-walls are still discovered.
 
     Args:
         domain: root domain, e.g. 'example.com' (no protocol, no www)
 
-    Returns: {'source': str, 'count': int, 'subdomains': list[str]}
+    Returns: {'count': int, 'subdomains': list[str], 'sources_ok': list,
+              'per_source': {...}, 'truncated': bool}
     """
     return _enumerate(domain)
 

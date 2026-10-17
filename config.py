@@ -20,8 +20,11 @@ OUTPUT_DIR = BASE_DIR / "output"
 BIN_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Popular recon tools we wrap
-TOOLS = ["subfinder", "httpx", "dnsx", "nuclei", "amass"]
+# Recon binaries we actually invoke. (amass is intentionally excluded: our
+# enumerator gets broader coverage from 8 parallel passive sources + an
+# active httpx pass, so it never calls amass. Listing it would only make
+# list_installed_tools report a tool we don't use as "missing".)
+TOOLS = ["subfinder", "httpx", "dnsx", "nuclei"]
 
 
 def _exe(name: str) -> str:

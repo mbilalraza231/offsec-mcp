@@ -11,6 +11,35 @@ No cloud APIs. No API keys. No telemetry. Everything runs on your machine.
 
 ---
 
+## Quick Start (60 seconds)
+
+```powershell
+# 1. clone + enter
+git clone https://github.com/mbilalraza231/offsec-mcp.git
+cd offsec-mcp
+
+# 2. virtual env + python deps
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1        # Windows  (macOS/Linux: source .venv/bin/activate)
+pip install -r requirements.txt
+
+# 3. (optional but recommended) fetch the recon binaries
+.\installers\install-tools.ps1      # macOS/Linux: ./installers/install-tools.sh
+
+# 4. start the MCP server
+python server.py                     # serves http://127.0.0.1:8000/sse
+```
+
+Then point any MCP client at `http://127.0.0.1:8000/sse` (SSE transport) and ask:
+
+> *"Use the full_recon tool on example.com"*
+
+> **It works without step 3.** Every tool has a pure-Python fallback, so you can
+> skip the binaries and still enumerate + check liveness + detect takeovers.
+> Only `scan_vulnerabilities` (nuclei) needs its binary.
+
+---
+
 ## Why
 
 Local LLMs (Llama 3, Qwen, DeepSeek via LlamaFile / Ollama) can reason about
@@ -21,9 +50,9 @@ is the bridge.
 
 | MCP tool | Backed by | Fallback |
 |----------|-----------|----------|
-| `enumerate_subdomains(domain)` | subfinder + **8 passive APIs** | all Python, no binary needed |
+| `enumerate_subdomains(domain)` | subfinder + **8 passive APIs** + **active httpx brute force** (browser-UA, sees through Vercel/Cloudflare) + Wayback crawl | all Python, no binary needed |
 | `resolve_subdomains(list)` | dnsx | dnspython |
-| `check_alive(list)` | httpx | Python requests |
+| `check_alive(list)` | httpx (browser-UA) | Python requests |
 | `scan_vulnerabilities(list)` | nuclei | none (clear error) |
 | `check_takeover(list)` | pure Python CNAME fingerprint | — |
 | `full_recon(domain)` | all of the above, one call | — |
