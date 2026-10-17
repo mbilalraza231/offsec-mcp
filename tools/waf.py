@@ -134,7 +134,7 @@ def _detect_body_signatures(body: str) -> list[str]:
     return hits
 
 
-def fingerprint(subdomains: list[str], max_subs: int = 50,
+def fingerprint(subdomains: list[str], max_subs: int = 150,
                 timeout: int = 8) -> dict:
     """Probe each subdomain once and classify CDN/WAF from response headers.
 

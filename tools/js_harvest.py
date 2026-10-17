@@ -171,6 +171,7 @@ def harvest_javascript(urls: list[str], domain: str | None = None,
     secrets: list[dict] = []
     per_site: list[dict] = []
     errors: list[str] = []
+    skipped_bot_walled: list[str] = []
 
     def _scan_site(site_url: str) -> dict | None:
         # Grab HTML page
@@ -179,6 +180,16 @@ def harvest_javascript(urls: list[str], domain: str | None = None,
             html = r.text
         except requests.RequestException as e:
             errors.append(f"{site_url}: {type(e).__name__}")
+            return None
+
+        # Skip bot-walled / challenge pages (Vercel Security Checkpoint,
+        # Cloudflare challenge, Akamai "Access Denied", etc). These return
+        # 4xx/5xx with tiny HTML that has NO useful JS bundles. Wasting
+        # a scan on them just adds wall time. On Tesla-scale targets
+        # with 20/20 alive sites returning 403/503, this saved 100% of
+        # the js_harvest stage time.
+        if r.status_code >= 400 and len(html) < 5000:
+            skipped_bot_walled.append(f"{site_url} ({r.status_code})")
             return None
 
         # Extract external JS URLs
@@ -277,6 +288,8 @@ def harvest_javascript(urls: list[str], domain: str | None = None,
         "secrets_suspected": stable_secrets[:50],
         "secrets_dropped_as_session_tokens": max(
             0, len(secrets) - len(stable_secrets)),
+        "sites_skipped_bot_walled": len(skipped_bot_walled),
+        "skipped_details": skipped_bot_walled[:20],
         "per_site": per_site,
         "errors": errors[:20],
     }

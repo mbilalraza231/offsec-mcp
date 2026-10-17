@@ -282,8 +282,16 @@ def full_recon(domain: str) -> dict:
     Returns one structured report. Saved automatically to ./output/.
     """
     enum = _enumerate(domain)
-    subs = enum.get("subdomains", [])[:50]
-    total_found = enum.get("count", len(subs))
+    # Prefer full sorted list (multi-source subs first) so we probe the
+    # highest-confidence hosts on huge targets. Fall back to display list
+    # for backwards compat with cached enum outputs.
+    all_subs = enum.get("subdomains_all") or enum.get("subdomains", [])
+    total_found = enum.get("count", len(all_subs))
+    # Dynamic cap: small targets probe everything; huge targets probe up
+    # to 150 (was fixed 30, which missed 470/499 on Tesla). 150 keeps
+    # wall time under 4min while covering the important hosts.
+    probe_cap = 150
+    subs = all_subs[:probe_cap]
     if not subs:
         return {"domain": domain, "error": "no subdomains found", "enum": enum}
 
@@ -319,7 +327,8 @@ def full_recon(domain: str) -> dict:
     tk_default = {"vulnerable": []}
     nuc_default = {"findings": [], "count": 0}
 
-    def _t_waf(): return _safe(lambda: _waf_fp(subs), "waf_fingerprint", waf_default)
+    def _t_waf(): return _safe(lambda: _waf_fp(alive_urls or subs),
+                               "waf_fingerprint", waf_default)
 
     def _t_js(): return _safe(
         lambda: _js_harvest(
@@ -359,6 +368,16 @@ def full_recon(domain: str) -> dict:
     missing_binaries = [b for b in ("subfinder", "httpx", "dnsx", "nuclei")
                         if not _find_tool(b)]
 
+    # Split WAF detections by how they were found (headers vs body marker).
+    # Body-source is the Fix-1 signal: "we caught Vercel/Cloudflare 403
+    # challenge pages that had no CDN headers".
+    waf_via_headers = sum(
+        1 for f in waf.get("fingerprints", [])
+        if f.get("detection_source") == "headers")
+    waf_via_body = sum(
+        1 for f in waf.get("fingerprints", [])
+        if f.get("detection_source") == "body")
+
     report = {
         "domain": domain,
         "subdomains_found": total_found,
@@ -369,15 +388,22 @@ def full_recon(domain: str) -> dict:
         "confidence_summary": enum.get("confidence_summary", {}),
         "sources_used": enum.get("per_source", {}),
         "sources_failed": enum.get("sources_failed", []),
-        "alive_details": alive.get("alive", [])[:10],
+        "alive_details": alive.get("alive", [])[:30],
         "waf_summary": waf.get("summary", {}),
-        "waf_details": waf.get("fingerprints", [])[:15],
+        "waf_detection_method": {
+            "via_headers": waf_via_headers,
+            "via_body_challenge": waf_via_body,
+        },
+        "waf_details": waf.get("fingerprints", [])[:20],
         "js_harvest": {
             "sites_scanned": js.get("sites_scanned", 0),
             "js_files_scanned": js.get("js_files_scanned", 0),
+            "sites_skipped_bot_walled": js.get("sites_skipped_bot_walled", 0),
             "extra_subdomains_found": js.get("subdomains_found", [])[:30],
             "endpoints_found": js.get("endpoints_found", [])[:60],
             "secrets_suspected": js.get("secrets_suspected", [])[:20],
+            "secrets_dropped_as_session_tokens": js.get(
+                "secrets_dropped_as_session_tokens", 0),
         },
         "sensitive_findings": {
             "total_checks": sensitive.get("total_checks", 0),

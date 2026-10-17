@@ -15,6 +15,8 @@ Pure HTTP to the free CDX API. No keys, no binaries.
 
 import re
 
+import requests
+
 from tools._http import strict_get
 
 # URL patterns that are worth surfacing first (bug-bounty triage priorities)
@@ -79,8 +81,10 @@ def harvest_archived_urls(domain: str, max_urls: int = 5000,
 
     # Wayback CDX is famously flaky: transient 503/504/timeout, especially
     # during peak hours. Retry up to 3 times with linear backoff before
-    # giving up. Only retry 5xx / RequestException - a clean 4xx means
-    # the query itself is bad, no point repeating.
+    # giving up. But only retry on 5xx / ReadTimeout / ChunkedEncodingError
+    # - a ConnectionError means the network layer itself is failing (DNS
+    # blocked, host down, port unreachable) and no amount of 2s waiting
+    # will fix it. On Tesla we wasted 40s retrying a ConnectionError.
     import time as _time
     max_attempts = 3
     backoff_secs = 2
@@ -99,7 +103,14 @@ def harvest_archived_urls(domain: str, max_urls: int = 5000,
                 continue
             # Non-retryable status (4xx) or last attempt failed
             break
+        except requests.exceptions.ConnectionError as e:
+            # Network-level failure - DNS, refused, unreachable. Do NOT
+            # retry, the same failure will happen immediately.
+            last_err = f"ConnectionError: {str(e)[:120]}"
+            resp = None
+            break
         except Exception as e:
+            # Timeouts and mid-response resets ARE retryable
             last_err = f"{type(e).__name__}: {str(e)[:120]}"
             if attempt < max_attempts:
                 _time.sleep(backoff_secs * attempt)

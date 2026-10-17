@@ -56,13 +56,31 @@ def scan_vulnerabilities(targets: list[str]) -> dict:
             except json.JSONDecodeError:
                 continue
         severity_counts = Counter(f["severity"] for f in findings)
-        return {
+        result = {
             "findings": findings,
             "count": len(findings),
             "severity_breakdown": dict(severity_counts),
             "engine": "nuclei",
+            "targets_scanned": len(targets),
         }
+        # Distinguish "nuclei ran & found nothing" (legit) from
+        # "nuclei errored / no templates" (misleading zero). If exit
+        # code != 0 and findings == 0, surface stderr preview so the
+        # user knows the scan didn't actually happen.
+        if proc.returncode != 0 and not findings:
+            result["engine_error"] = (
+                f"nuclei exit={proc.returncode}; "
+                f"stderr preview: {(proc.stderr or '')[:250]}"
+            )
+        return result
     except subprocess.TimeoutExpired:
-        return {"findings": [], "count": 0, "message": "nuclei scan timed out"}
+        return {
+            "findings": [], "count": 0,
+            "engine": "nuclei",
+            "engine_error": (
+                f"nuclei scan timed out after {TIMEOUT}s. Reduce target "
+                "count or run standalone with narrower template set."
+            ),
+        }
     finally:
         Path(target_file).unlink(missing_ok=True)

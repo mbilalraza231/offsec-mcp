@@ -129,6 +129,7 @@ def check_sensitive_files(urls: list[str], max_urls: int = 25,
                  "preview"}, ...
             ],
             "counts_by_severity": {"critical":N,"high":N,...},
+            "soft404_filtered": int,   # findings dropped as SPA fallback
             "errors": [str,...],
         }
     """
@@ -138,6 +139,36 @@ def check_sensitive_files(urls: list[str], max_urls: int = 25,
     urls = [u.rstrip("/") for u in urls[:max_urls]]
     findings: list[dict] = []
     errors: list[str] = []
+    soft404_dropped = 0
+
+    # ---- Baseline soft-404 detection per base URL ----
+    # SPAs (Next.js, Angular, Vue) & some WAFs serve the SAME fallback page
+    # for ANY unknown path with status 200. Without this filter, auth.tesla.com
+    # returned "critical" hits for /dump.sql, /test.php, /latest.dump etc. -
+    # all showing the login HTML, none actually leaked.
+    #
+    # Method: fetch a random 40-char nonce path per base URL. If it returns
+    # 200 with non-trivial body, we assume any subsequent 200 with matching
+    # length AND matching first 200 bytes is the same soft-404 SPA fallback.
+    import random as _random
+    import string as _string
+
+    def _get_baseline(base_url: str) -> tuple[int, bytes] | None:
+        nonce = "".join(
+            _random.choices(_string.ascii_lowercase + _string.digits, k=40))
+        url = f"{base_url}/offsec-baseline-{nonce}"
+        try:
+            r = _get(url, timeout=timeout)
+        except requests.RequestException:
+            return None
+        if r.status_code != 200 or len(r.content) < 5:
+            return None
+        return (len(r.content), r.content[:200])
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        baselines: dict[str, tuple[int, bytes] | None] = dict(
+            zip(urls, pool.map(_get_baseline, urls))
+        )
 
     def _probe(task):
         base_url, path = task
@@ -157,10 +188,17 @@ def check_sensitive_files(urls: list[str], max_urls: int = 25,
         # skip. Otherwise wildcard DNS would inflate every path into a hit.
         low = r.content[:2000].lower()
         if any(m in low for m in WILDCARD_MARKERS):
-            # Special case: some wildcard pages don't say 404 but return
-            # identical HTML for every path. That is caught upstream by
-            # httpx content-diff so we still filter obvious markers here.
             return None
+        # Baseline soft-404: if this response matches the SPA fallback page
+        # we detected for this base URL, discard as false positive.
+        baseline = baselines.get(base_url)
+        if baseline:
+            blen, bpre = baseline
+            rlym = len(r.content)
+            # Same length within 5% AND same first-200 signature = fallback
+            if abs(rlym - blen) <= max(20, blen * 0.05) \
+                    and r.content[:200] == bpre:
+                return "SOFT404_BASELINE"
         preview = r.text[:250].replace("\n", " ").replace("\r", " ").strip()
         sev = SEVERITY_MAP.get(path, "info")
         return {
@@ -178,7 +216,9 @@ def check_sensitive_files(urls: list[str], max_urls: int = 25,
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for res in pool.map(_probe, tasks):
-            if res:
+            if res == "SOFT404_BASELINE":
+                soft404_dropped += 1
+            elif res:
                 findings.append(res)
 
     counts = {"critical": 0, "high": 0, "medium": 0, "info": 0}
@@ -191,5 +231,6 @@ def check_sensitive_files(urls: list[str], max_urls: int = 25,
         "total_checks": len(tasks),
         "findings": findings,
         "counts_by_severity": counts,
+        "soft404_filtered": soft404_dropped,
         "errors": errors[:20],
     }

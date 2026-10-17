@@ -66,7 +66,7 @@ def enumerate_subdomains(domain: str) -> dict:
         try:
             out = subprocess.check_output(
                 [sf, "-d", domain, "-silent", "-all"],
-                stderr=subprocess.DEVNULL, timeout=90,
+                stderr=subprocess.DEVNULL, timeout=180,
             ).decode(errors="ignore")
             hits = {l.strip().lower()
                     for l in out.splitlines()
@@ -75,8 +75,13 @@ def enumerate_subdomains(domain: str) -> dict:
                 collected |= hits
                 source_detail["subfinder"] = sorted(hits)
                 sources_ok.append(f"subfinder({len(hits)})")
+            else:
+                sources_fail.append("subfinder:empty")
         except subprocess.TimeoutExpired:
-            sources_fail.append("subfinder:timeout(90s)")
+            # Tesla-scale targets: subfinder fans out to 50+ upstream APIs,
+            # some of which are slow. 90s was too tight for orgs with 500+
+            # subs. 180s now, but still record the miss so users know.
+            sources_fail.append("subfinder:timeout(180s)")
         except Exception as e:
             sources_fail.append(f"subfinder:{e.__class__.__name__}")
 
@@ -193,7 +198,14 @@ def enumerate_subdomains(domain: str) -> dict:
     # Cap the returned list to avoid overwhelming the LLM context window.
     # Full list is saved via save_results; model only sees first 30 + count.
     MAX_RETURN = 30
-    display = subs[:MAX_RETURN] if len(subs) > MAX_RETURN else subs
+
+    # Sort by confidence (source_count descending) so the most-corroborated
+    # hosts are the ones that survive any downstream [:N] truncation. On
+    # Tesla-scale targets (499 subs) this ensures active stages probe the
+    # hosts seen by 2+ sources first, not the 1-source long tail.
+    subs_sorted = sorted(
+        subs, key=lambda s: source_count.get(s, 0), reverse=True)
+    display = subs_sorted[:MAX_RETURN]
 
     # Per-sub detail bundle (host & which sources & corroboration count)
     subdomain_details = [
@@ -217,6 +229,9 @@ def enumerate_subdomains(domain: str) -> dict:
         "count": len(subs),
         "showing": len(display),
         "subdomains": display,
+        # Full sorted list for downstream pipeline stages (not returned to
+        # the LLM as text; only internal tools like full_recon read this)
+        "subdomains_all": subs_sorted,
         "subdomain_details": subdomain_details,
         "sources_by_sub": {s: sources_by_sub[s] for s in display},
         "confidence_summary": confidence_summary,
@@ -233,9 +248,13 @@ def enumerate_subdomains(domain: str) -> dict:
 
 def _crtsh(domain: str) -> set[str]:
     """Certificate Transparency logs via crt.sh.
-    Returns common names from all issued certificates."""
+    Returns common names from all issued certificates.
+
+    crt.sh is notoriously slow on huge targets (Tesla, Google, Microsoft).
+    Tesla alone has ~15k certs; response body can be 20MB+. We give crt.sh
+    a 60s timeout instead of the shared TIMEOUT (25s)."""
     url = f"https://crt.sh/?q={quote('%.' + domain)}&output=json"
-    resp = requests.get(url, timeout=TIMEOUT, headers=HEADERS)
+    resp = requests.get(url, timeout=60, headers=HEADERS)
     resp.raise_for_status()
     out: set[str] = set()
     for entry in resp.json():
