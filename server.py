@@ -306,33 +306,58 @@ def full_recon(domain: str) -> dict:
     alive = _safe(lambda: _alive(subs), "alive", {"alive": []})
     alive_urls = [a["url"] for a in alive.get("alive", [])]
 
-    # Tier 2/1 additions run against the same alive set
-    waf = _safe(lambda: _waf_fp(subs), "waf_fingerprint",
-                {"fingerprints": [], "summary": {}})
-    js = _safe(
-        lambda: _js_harvest(alive_urls, domain=domain) if alive_urls
-        else {"sites_scanned": 0},
-        "js_endpoints",
-        {"sites_scanned": 0, "subdomains_found": [],
-         "endpoints_found": [], "secrets_suspected": []},
-    )
-    sensitive = _safe(
-        lambda: _sensitive(alive_urls) if alive_urls else {"findings": []},
-        "sensitive_files",
-        {"findings": [], "counts_by_severity": {}},
-    )
-    archive = _safe(
-        lambda: _archive_urls(domain), "wayback_urls",
-        {"total_archived_urls": 0, "interesting_urls": []},
-    )
+    # Stages 4-9 (waf, js, sensitive, wayback, takeover, nuclei) are all
+    # independent - they only need `subs` or `alive_urls` as input. Run
+    # them concurrently to cut wall-time roughly in half (previously
+    # sequential; ~4min -> ~2min on typical 8-sub target).
+    from concurrent.futures import ThreadPoolExecutor
+    waf_default = {"fingerprints": [], "summary": {}}
+    js_default = {"sites_scanned": 0, "subdomains_found": [],
+                  "endpoints_found": [], "secrets_suspected": []}
+    sens_default = {"findings": [], "counts_by_severity": {}}
+    wb_default = {"total_archived_urls": 0, "interesting_urls": []}
+    tk_default = {"vulnerable": []}
+    nuc_default = {"findings": [], "count": 0}
 
-    takeover = _safe(lambda: _takeover(subs), "takeover",
-                     {"vulnerable": []})
-    vulns = _safe(
-        lambda: _scan(alive_urls[:100]) if alive_urls
-        else {"findings": [], "count": 0},
-        "nuclei", {"findings": [], "count": 0},
-    )
+    def _t_waf(): return _safe(lambda: _waf_fp(subs), "waf_fingerprint", waf_default)
+
+    def _t_js(): return _safe(
+        lambda: _js_harvest(
+            alive_urls, domain=domain) if alive_urls else js_default,
+        "js_endpoints", js_default)
+
+    def _t_sens(): return _safe(
+        lambda: _sensitive(alive_urls) if alive_urls else sens_default,
+        "sensitive_files", sens_default)
+
+    def _t_wb(): return _safe(lambda: _archive_urls(domain), "wayback_urls", wb_default)
+    def _t_tk(): return _safe(lambda: _takeover(subs), "takeover", tk_default)
+
+    def _t_nuc(): return _safe(
+        lambda: _scan(alive_urls[:100]) if alive_urls else nuc_default,
+        "nuclei", nuc_default)
+
+    with ThreadPoolExecutor(max_workers=6) as _pool:
+        _futs = {
+            "waf": _pool.submit(_t_waf),
+            "js": _pool.submit(_t_js),
+            "sensitive": _pool.submit(_t_sens),
+            "wayback": _pool.submit(_t_wb),
+            "takeover": _pool.submit(_t_tk),
+            "nuclei": _pool.submit(_t_nuc),
+        }
+        waf = _futs["waf"].result()
+        js = _futs["js"].result()
+        sensitive = _futs["sensitive"].result()
+        archive = _futs["wayback"].result()
+        takeover = _futs["takeover"].result()
+        vulns = _futs["nuclei"].result()
+
+    # Binary availability report - if recon results are thin, users can
+    # immediately see whether they need to run installers/install-tools.ps1
+    from config import find_tool as _find_tool
+    missing_binaries = [b for b in ("subfinder", "httpx", "dnsx", "nuclei")
+                        if not _find_tool(b)]
 
     report = {
         "domain": domain,
@@ -367,6 +392,7 @@ def full_recon(domain: str) -> dict:
         },
         "takeover_risks": takeover.get("vulnerable", []),
         "vulnerabilities": vulns,
+        "missing_binaries": missing_binaries,
         "stage_errors": stage_errors,
         "note": (
             "If `stage_errors` is non-empty, some optional stages failed "

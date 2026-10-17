@@ -264,12 +264,19 @@ def harvest_javascript(urls: list[str], domain: str | None = None,
             if h == d or h.endswith("." + d)
         }
 
+    # Drop per-session CSRF/challenge tokens that our loose
+    # `generic_secret_assignment` regex catches on webmail/login pages.
+    # Filter refetches each source once & keeps only stable values.
+    stable_secrets = _filter_stable_secrets(secrets, timeout=timeout)
+
     return {
         "sites_scanned": len(per_site),
         "js_files_scanned": sum(p["js_files_scanned"] for p in per_site),
         "subdomains_found": sorted(unique_hosts),
         "endpoints_found": sorted(unique_endpoints)[:500],
-        "secrets_suspected": secrets[:50],
+        "secrets_suspected": stable_secrets[:50],
+        "secrets_dropped_as_session_tokens": max(
+            0, len(secrets) - len(stable_secrets)),
         "per_site": per_site,
         "errors": errors[:20],
     }
@@ -321,4 +328,59 @@ def _extract_all(text: str, source: str,
                 "kind": kind,
                 "value_preview": truncated,
                 "found_in": source,
+                # raw_value kept internally for the stability filter below;
+                # stripped from output so this tool never exfiltrates real
+                # credentials even if downstream code logs the return dict.
+                "raw_value": val,
             })
+
+
+def _filter_stable_secrets(secrets: list[dict], timeout: int = 8) -> list[dict]:
+    """Drop per-session tokens by refetching each source URL once.
+
+    Problem: our `generic_secret_assignment` regex happily matches the
+    CSRF / challenge token on Roundcube / cPanel / WordPress login pages
+    (e.g. mail.example.com returns `<input name="challengeToken" value=
+    "KPInHXZtsk5Z...">` on every request with a NEW random value). Those
+    are NOT leaked credentials - they're normal session state.
+
+    Method: for every candidate secret, refetch `found_in` URL. If the
+    exact raw value still appears in the response, it's stable across
+    requests => treat as real leak. If it's gone or changed => session
+    token => discard.
+
+    Cost: 1 extra HTTP GET per source URL that produced a hit. Bounded
+    by the fact that most sites have 0-2 candidates.
+    """
+    if not secrets:
+        return []
+
+    from collections import defaultdict
+    by_source: dict[str, list[dict]] = defaultdict(list)
+    for s in secrets:
+        by_source[s["found_in"]].append(s)
+
+    survivors: list[dict] = []
+    for source, items in by_source.items():
+        try:
+            r = _get(source, timeout=timeout)
+            fresh = r.text if r.status_code == 200 else None
+        except Exception:
+            fresh = None
+
+        if fresh is None:
+            # Cannot verify stability - keep conservatively. Better to
+            # show a possible false positive than to silently drop a
+            # real leak because the refetch failed (e.g. rate-limited).
+            survivors.extend(items)
+            continue
+
+        for s in items:
+            if s.get("raw_value") and s["raw_value"] in fresh:
+                survivors.append(s)
+            # else: value not stable => session token => drop
+
+    # Strip raw_value from output before returning to caller
+    for s in survivors:
+        s.pop("raw_value", None)
+    return survivors

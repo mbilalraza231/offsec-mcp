@@ -77,19 +77,40 @@ def harvest_archived_urls(domain: str, max_urls: int = 5000,
     if to_year:
         params["to"] = str(to_year)
 
+    # Wayback CDX is famously flaky: transient 503/504/timeout, especially
+    # during peak hours. Retry up to 3 times with linear backoff before
+    # giving up. Only retry 5xx / RequestException - a clean 4xx means
+    # the query itself is bad, no point repeating.
+    import time as _time
+    max_attempts = 3
+    backoff_secs = 2
+    url = f"http://web.archive.org/cdx/search/cdx?{urlencode_params(params)}"
+
     resp = None
-    try:
-        resp = strict_get(
-            f"http://web.archive.org/cdx/search/cdx?{urlencode_params(params)}",
-            timeout=timeout,
-        )
-    except Exception as e:
-        # Wayback CDX is famously flaky: 45s timeouts, 503s, mid-response
-        # connection resets. Do NOT let a transient archive outage kill
-        # a whole recon pipeline - return a graceful error dict instead.
+    last_err: str | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = strict_get(url, timeout=timeout)
+            if resp.status_code == 200:
+                break
+            if 500 <= resp.status_code < 600 and attempt < max_attempts:
+                last_err = f"wayback CDX returned {resp.status_code} (attempt {attempt})"
+                _time.sleep(backoff_secs * attempt)
+                continue
+            # Non-retryable status (4xx) or last attempt failed
+            break
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            if attempt < max_attempts:
+                _time.sleep(backoff_secs * attempt)
+                continue
+            resp = None
+            break
+
+    if resp is None:
         return {
             "domain": domain,
-            "error": f"wayback CDX unavailable ({type(e).__name__}: {str(e)[:120]})",
+            "error": f"wayback CDX unavailable after {max_attempts} retries ({last_err})",
             "total_archived_urls": 0,
             "unique_subdomains": [],
             "interesting_urls": [],
@@ -100,7 +121,7 @@ def harvest_archived_urls(domain: str, max_urls: int = 5000,
         }
     if resp.status_code != 200:
         return {
-            "error": f"wayback CDX returned {resp.status_code}",
+            "error": f"wayback CDX returned {resp.status_code} after {max_attempts} attempts",
             "domain": domain,
             "total_archived_urls": 0,
             "unique_subdomains": [],

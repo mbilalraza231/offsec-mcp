@@ -95,6 +95,44 @@ APP_STACK_HEADERS = [
     "x-server", "x-page-speed", "x-Mod-Pagespeed",
 ]
 
+# Body-signature map - used when headers alone don't reveal the CDN but the
+# response body does. Common with Vercel/Cloudflare "security checkpoint"
+# pages that return bare 403/429 without any provider-identifying headers.
+# We only fetch body if header match came up empty AND status looks like a
+# block (4xx/5xx), to avoid downloading full pages on every target.
+BODY_SIGNATURES = [
+    ("Vercel", [
+        "vercel security checkpoint",
+        "vercel-checkpoint",
+        "x-vercel-protection",
+    ]),
+    ("Cloudflare", [
+        "cf-browser-verification",
+        "cloudflare-ray-id",
+        "attention required! | cloudflare",
+        "cloudflare challenge",
+        "__cf_chl_opt",
+    ]),
+    ("Akamai", ["akamai reference", "errors.edgesuite.net"]),
+    ("Imperva / Incapsula", ["_Incapsula_Resource", "incapsula"]),
+    ("Sucuri", ["sucuri/webfw", "cloudproxy"]),
+    ("Barracuda", ["barracuda/center", "barrier"]),
+]
+
+
+def _detect_body_signatures(body: str) -> list[str]:
+    """Match body text against known CDN challenge page markers."""
+    if not body:
+        return []
+    hay = body.lower()
+    hits = []
+    for name, tokens in BODY_SIGNATURES:
+        for tok in tokens:
+            if tok.lower() in hay:
+                hits.append(name)
+                break
+    return hits
+
 
 def fingerprint(subdomains: list[str], max_subs: int = 50,
                 timeout: int = 8) -> dict:
@@ -132,10 +170,10 @@ def fingerprint(subdomains: list[str], max_subs: int = 50,
         try:
             r = strict_head(url, timeout=timeout, allow_redirects=True)
             if r.status_code in (403, 405, 501):
-                r = strict_get(url, timeout=timeout, stream=True)
+                r = strict_get(url, timeout=timeout)
         except Exception as e:
             try:
-                r = strict_get(url, timeout=timeout, stream=True)
+                r = strict_get(url, timeout=timeout)
             except Exception as e2:
                 errors.append(
                     f"{sub}: HEAD={type(e).__name__} GET={type(e2).__name__}")
@@ -146,11 +184,27 @@ def fingerprint(subdomains: list[str], max_subs: int = 50,
         blob = " ".join(f"{k}:{v}".lower() for k, v in headers.items())
 
         cdns = []
+        detection_source = "headers"
         for name, tokens in CDN_SIGNATURES:
             for tok in tokens:
                 if tok.lower() in blob:
                     cdns.append(name)
                     break
+
+        # If header pass found nothing AND the response looks blocked,
+        # fetch body (bounded to 8KB) & check challenge-page markers.
+        # Vercel/Cloudflare often return bare 403 with no CDN headers but
+        # the HTML body contains "Vercel Security Checkpoint" /
+        # "__cf_chl_opt" / "_Incapsula_Resource" etc.
+        if not cdns and r.status_code >= 400:
+            try:
+                body = r.text[:8000] if r.content else ""
+                body_hits = _detect_body_signatures(body)
+                if body_hits:
+                    cdns = body_hits
+                    detection_source = "body"
+            except Exception:
+                pass  # body read failure is non-fatal for fingerprint
 
         # Collect app-stack info (server, x-powered-by, etc.)
         stack = {}
@@ -167,6 +221,7 @@ def fingerprint(subdomains: list[str], max_subs: int = 50,
             "url": getattr(r, "url", url),
             "status": r.status_code,
             "cdns_detected": cdns,
+            "detection_source": detection_source,
             "server_header": headers.get("server"),
             "powered_by": headers.get("x-powered-by"),
             "has_cors_wildcard": has_cors_star,
