@@ -1,0 +1,41 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ---- Secrets / env ----
+.env
+.env.local
+*.pem
+*.key
+
+# ---- Recon binaries (installed by installer, not committed) ----
+bin/*
+!bin/.gitkeep
+
+# ---- Scan output (user data, not committed) ----
+output/*
+!output/.gitkeep
+
+# ---- Editor / OS noise ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- Logs / tmp ----
+*.log
+*.tmp
+tmp/
+
+# ---- Runtime scratch (regenerated during scans) ----
+wordlists/_brute_candidates.txt
+_brute_candidates.txt

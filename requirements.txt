@@ -1,0 +1,9 @@
+# Core MCP SDK v2 (MCPServer + SSE transport)
+mcp[cli]>=2,<3
+
+# HTTP + DNS
+requests>=2.31.0
+dnspython>=2.4.0
+
+# Optional: nicer tracebacks during development
+rich>=13.7.0
