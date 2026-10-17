@@ -80,8 +80,8 @@ def enumerate_subdomains(domain: str) -> dict:
         except Exception as e:
             sources_fail.append(f"subfinder:{e.__class__.__name__}")
 
-    # --- 2-8. All HTTP sources in parallel ---
-    with ThreadPoolExecutor(max_workers=7) as pool:
+    # --- 2-9. All HTTP passive sources in parallel ---
+    with ThreadPoolExecutor(max_workers=8) as pool:
         future_map = {
             pool.submit(_fetch_with_retry, fn, domain, retries):
             (name, fn, retries)
@@ -102,7 +102,43 @@ def enumerate_subdomains(domain: str) -> dict:
             except Exception:
                 sources_fail.append(f"{name}:failed")
 
-    # ---- 7. Active DNS verification (smart brute force) ----
+    # ---- 7. Active DNS brute (dnsx over full 110k wordlist) ----
+    # Catches non-web subdomains (git, smtp, jenkins, redis, internal
+    # tools) that have an A record but no HTTP server -> invisible to
+    # httpx content-diff. Wildcard-aware via IP-pool filter.
+    dnsx_words = _load_words_full()
+    dnsx_hits = _dnsx_brute(domain, dnsx_words)
+    if dnsx_hits:
+        new = dnsx_hits - collected
+        collected |= dnsx_hits
+        if new:
+            source_detail["dnsx-brute"] = sorted(new)
+            sources_ok.append(f"dnsx-brute({len(new)})")
+        else:
+            sources_fail.append("dnsx-brute:no-new")
+    else:
+        sources_fail.append("dnsx-brute:empty-or-no-dnsx")
+
+    # ---- 8. Altdns-style permutations (compound names not in wordlists) ----
+    # Take every label discovered so far (from passive + dnsx) and generate
+    # api1/api-1/dev-api/staging-api etc. Then verify via dnsx (fast).
+    perms = _permutations(collected, domain)
+    if perms:
+        perm_hits = _dnsx_brute(domain, perms, timeout=60)
+        if perm_hits:
+            new = perm_hits - collected
+            collected |= perm_hits
+            if new:
+                source_detail["permutations"] = sorted(new)
+                sources_ok.append(f"permutations({len(new)})")
+            else:
+                sources_fail.append("permutations:no-new")
+        else:
+            sources_fail.append("permutations:empty")
+    else:
+        sources_fail.append("permutations:no-labels")
+
+    # ---- 9. Active HTTP verify (httpx content-diff on curated names) ----
     # Resolve common names via DNS. Detect wildcard by checking if ALL
     # candidates resolve to the same IPs. If wildcard: only keep names
     # with UNIQUE IP responses. If no wildcard: keep all that resolved.
@@ -113,8 +149,17 @@ def enumerate_subdomains(domain: str) -> dict:
         source_detail["active-dns"] = sorted(active)
         sources_ok.append(f"active-dns({len(active)})")
 
-    # ---- 8. Wayback link-crawl (finds hosts referenced in archived pages) ----
-    crawled = _wayback_crawl(domain)
+    # ---- 10. Wayback link-crawl with widened seed list ----
+    # Seed from apex + www + up to 4 discovered hosts, so archived pages
+    # on ANY known sub (not just base domain) contribute cross-links.
+    crawl_seeds = [domain, f"www.{domain}"]
+    for s in sorted(collected):
+        if s in crawl_seeds:
+            continue
+        if len(crawl_seeds) >= 6:
+            break
+        crawl_seeds.append(s)
+    crawled = _wayback_crawl(domain, seeds=crawl_seeds)
     if crawled:
         new = crawled - collected
         collected |= crawled
@@ -226,18 +271,24 @@ def _wayback(domain: str) -> set[str]:
     return out
 
 
-def _wayback_crawl(domain: str, max_pages: int = 8) -> set[str]:
+def _wayback_crawl(domain: str, max_pages: int = 8,
+                   seeds: list[str] | None = None) -> set[str]:
     """Wayback link-crawl: scrape archived HTML and extract subdomain refs.
 
     This finds hosts like `restaurant.target.com` that were NEVER archived
     themselves but appear as links/assets inside an archived homepage. The
     CDX API (source #6) only returns archived *URLs*; this digs the
     references out of the archived *page bodies*.
+
+    seeds: hostnames whose archived pages we should crawl. Defaults to the
+    apex + www only, but callers can pass in extra discovered hosts to
+    widen the net (e.g. any sub that had an archived landing page).
     """
     out: set[str] = set()
-    # 1. Find snapshots of the homepage (apex + www). CDX returns oldest
-    # first, so we pull a wide range then keep the NEWEST max_pages.
-    seeds = [domain, f"www.{domain}"]
+    # 1. Find snapshots of the homepage (apex + www + caller-supplied seeds).
+    # CDX returns oldest first, so we pull a wide range then keep the NEWEST.
+    if seeds is None:
+        seeds = [domain, f"www.{domain}"]
     seen_ts: set[str] = set()
     snapshots: list[tuple[str, str]] = []  # (timestamp, original_url)
     for seed in seeds:
@@ -323,6 +374,30 @@ def _bgp_he(domain: str) -> set[str]:
     return out
 
 
+def _certspotter(domain: str) -> set[str]:
+    """CertSpotter API - independent Certificate Transparency mirror.
+
+    crt.sh 502s often and has no SLA; CertSpotter (SSLMate) queries a
+    different set of CT logs so it fills gaps crt.sh leaves. Free, no auth,
+    returns 10 requests/hour per IP unauthenticated - we call once per scan
+    which is well within limits."""
+    url = (f"https://api.certspotter.com/v1/issuances"
+           f"?domain={quote(domain)}&include_subdomains=true"
+           f"&expand=dns_names")
+    resp = requests.get(url, timeout=TIMEOUT, headers=HEADERS)
+    if resp.status_code == 429:
+        # Rate-limited -> caller's retry will back off and skip gracefully
+        raise RuntimeError("certspotter rate-limited (429)")
+    resp.raise_for_status()
+    out: set[str] = set()
+    for cert in resp.json():
+        for name in cert.get("dns_names") or []:
+            name = name.strip().lower().lstrip("*.")
+            if name:
+                out.add(name)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -356,13 +431,14 @@ def _is_valid_hostname(host: str) -> bool:
 # Source registry (defined after all functions so references resolve)
 # ---------------------------------------------------------------------------
 PASSIVE_SOURCES = [
-    ("crt.sh",        _crtsh,         3),
-    ("hackertarget",  _hackertarget,  2),
-    ("alienvault",    _alienvault,    2),
-    ("rapiddns",      _rapiddns,      2),
-    ("wayback",       _wayback,       2),
-    ("thc-org",       _thc_org,       2),
-    ("bgp-he",        _bgp_he,        2),
+    ("crt.sh",         _crtsh,          3),
+    ("certspotter",    _certspotter,    2),
+    ("hackertarget",   _hackertarget,   2),
+    ("alienvault",     _alienvault,     2),
+    ("rapiddns",       _rapiddns,       2),
+    ("wayback",        _wayback,        2),
+    ("thc-org",        _thc_org,        2),
+    ("bgp-he",         _bgp_he,         2),
 ]
 
 
@@ -508,3 +584,163 @@ def _active_dns_verify(domain: str) -> set[str]:
         found.add(domain)
 
     return found
+
+
+# ---------------------------------------------------------------------------
+# DNS brute force + Altdns-style permutation
+# ---------------------------------------------------------------------------
+# Two coverage gaps the HTTP content-diff pass above can't fill:
+#   1. Non-web subdomains (git, jenkins, smtp, redis, internal-tools)
+#      often have an A record but serve NO HTTP on ports 80/443 -> httpx
+#      never sees them. dnsx finds them purely via DNS resolution.
+#   2. Compound real-world names (staging-api, api-v2, dev-mail) aren't
+#      in any wordlist. Altdns-style permutation takes known labels and
+#      generates cross-products the target actually uses.
+
+PERMUTATION_MODIFIERS = (
+    "dev", "test", "staging", "stage", "prod", "production",
+    "api", "app", "internal", "portal", "admin", "backend",
+    "v1", "v2", "v3", "new", "old", "beta", "alpha", "backup",
+    "cdn", "edge", "cache", "lb", "us", "eu", "asia",
+)
+
+
+def _load_words_full() -> list[str]:
+    """Full SecLists wordlist. Only single-label entries (no dots)."""
+    try:
+        with open(WORDLIST_PATH, encoding="utf-8", errors="ignore") as f:
+            return [ln.strip().lower() for ln in f
+                    if ln.strip() and "." not in ln.strip()]
+    except FileNotFoundError:
+        return []
+
+
+def _run_dnsx(dnsx: str, hosts: list[str], timeout: int) -> dict:
+    """Run dnsx with -a (A records). Returns {host: [ip, ...]}.
+
+    Uses JSON output because dnsx emits ANSI color codes on Windows and
+    its non-JSON `-a` mode prints only hostnames (no IPs) unless you also
+    pass -resp; -json is unambiguous. Uses stdin instead of -l because
+    dnsx's -l auto-wildcard detection over-filters and drops legitimate
+    results. Threads/timeout kept moderate (50/5s/2 retries) because
+    aggressive settings like 150 threads + 3s cause silent UDP failures
+    on home broadband resolvers."""
+    import json
+    if not hosts:
+        return {}
+    result: dict[str, list[str]] = {}
+    ansi = re.compile(r"\x1b\[[0-9;]*m")
+    try:
+        payload = "\n".join(hosts).encode()
+        out = subprocess.check_output(
+            [dnsx, "-silent", "-json", "-a",
+             "-t", "50", "-retry", "2", "-timeout", "5"],
+            input=payload, stderr=subprocess.DEVNULL, timeout=timeout,
+        ).decode(errors="ignore")
+        for line in out.splitlines():
+            line = ansi.sub("", line).strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            host = (obj.get("host") or "").lower().rstrip(".")
+            a = obj.get("a") or []
+            if isinstance(a, str):
+                a = [a]
+            if host and a:
+                result.setdefault(host, []).extend(a)
+    except Exception:
+        pass
+    return result
+
+
+def _dnsx_brute(domain: str, words: list[str], timeout: int = 180) -> set[str]:
+    """Brute force DNS resolution over a large wordlist, wildcard-aware.
+
+    Wildcard handling: probe 5 random nonsense names first.
+      - none resolve  -> domain has NO wildcard DNS. Every resolved
+        candidate from the wordlist is a REAL hit.
+      - all resolve   -> wildcard DNS is on. Collect the wildcard IP pool,
+        then keep ONLY candidates whose IPs fall outside that pool (i.e.
+        truly different infrastructure). Same-IP candidates are noise.
+    """
+    import random
+    import string
+    dnsx = find_tool("dnsx")
+    if not dnsx or not words:
+        return set()
+
+    baseline = [
+        f"{''.join(random.choices(string.ascii_lowercase, k=12))}.{domain}"
+        for _ in range(5)
+    ]
+    baseline_res = _run_dnsx(dnsx, baseline, timeout=15)
+    has_wildcard = bool(baseline_res)
+    wildcard_ips: set[str] = set()
+    for host, ips in baseline_res.items():
+        wildcard_ips.update(ips)
+
+    candidates = [f"{w}.{domain}" for w in words]
+    resolved = _run_dnsx(dnsx, candidates, timeout=timeout)
+
+    out: set[str] = set()
+    for host, ips in resolved.items():
+        if host in baseline:
+            continue
+        if not _is_valid_subdomain(host, domain):
+            continue
+        if has_wildcard and wildcard_ips and set(ips).issubset(wildcard_ips):
+            continue  # wildcard noise -> identical IP pool
+        out.add(host)
+    return out
+
+
+def _permutations(known_subs: set[str], domain: str,
+                  max_out: int = 2000) -> list[str]:
+    """Altdns-style candidate words derived from already-known labels.
+
+    For each discovered single-label prefix (e.g. `api`, `dev`, `staging`)
+    generate variants real orgs commonly use but wordlists miss:
+      numbered       : api1, api-1, 1api, 1-api
+      modifier cross : api-dev, dev-api, api-staging, staging-api, ...
+      dotted nesting : dev-api -> dev.api (a nested sub of an existing sub)
+
+    Returns candidate single-label prefixes ready to prepend to `domain`.
+    Caller pipes them through dnsx / httpx like any other wordlist."""
+    suffix = f".{domain}"
+    labels: set[str] = set()
+    for sub in known_subs:
+        s = sub.lower()
+        if not s.endswith(suffix):
+            continue
+        prefix = s[: -len(suffix)]
+        if not prefix or "." in prefix:
+            continue  # skip apex and multi-label hosts
+        labels.add(prefix)
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for label in labels:
+        for n in range(1, 4):
+            for form in (f"{label}{n}", f"{label}-{n}",
+                         f"{n}{label}", f"{n}-{label}"):
+                if form not in seen:
+                    seen.add(form)
+                    out.append(form)
+        for m in PERMUTATION_MODIFIERS:
+            if m == label:
+                continue
+            for form in (f"{label}-{m}", f"{m}-{label}"):
+                if form not in seen:
+                    seen.add(form)
+                    out.append(form)
+        if "-" in label:
+            dotted = label.replace("-", ".")
+            if dotted not in seen:
+                seen.add(dotted)
+                out.append(dotted)
+        if len(out) >= max_out:
+            break
+    return out[:max_out]

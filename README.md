@@ -50,7 +50,7 @@ is the bridge.
 
 | MCP tool | Backed by | Fallback |
 |----------|-----------|----------|
-| `enumerate_subdomains(domain)` | subfinder + **8 passive APIs** + **active httpx brute force** (browser-UA, sees through Vercel/Cloudflare) + Wayback crawl | all Python, no binary needed |
+| `enumerate_subdomains(domain)` | subfinder -all + **9 passive APIs** + **dnsx 110k-wordlist DNS brute** (finds non-web subs like git/smtp/jenkins) + **Altdns-style permutation engine** (finds compound names like staging-api, api-v2) + **httpx content-diff brute** (browser-UA, sees through Vercel/Cloudflare) + Wayback crawl | all Python, no binary needed |
 | `resolve_subdomains(list)` | dnsx | dnspython |
 | `check_alive(list)` | httpx (browser-UA) | Python requests |
 | `scan_vulnerabilities(list)` | nuclei | none (clear error) |
@@ -60,28 +60,31 @@ is the bridge.
 | `list_installed_tools()` | runtime binary detection | — |
 | `list_previous_scans()` | reads `./output/` | — |
 
-### 8 Passive Sources (all free, no keys needed)
+### 9 Passive Sources (all free, no keys needed)
 
-The `enumerate_subdomains` tool queries **8 sources in parallel** using
+The `enumerate_subdomains` tool queries **9 sources in parallel** using
 ThreadPoolExecutor. Any single failure never blocks the pipeline.
 
 | # | Source | Type | What it finds |
 |---|--------|------|---------------|
-| 1 | subfinder (binary) | 50+ APIs merged | Massive passive coverage |
+| 1 | subfinder (binary, `-all`) | 50+ APIs merged | Massive passive coverage |
 | 2 | crt.sh | Cert Transparency | All issued SSL certs |
-| 3 | HackerTarget | Passive DNS | Free hostsearch API |
-| 4 | AlienVault OTX | Passive DNS | Historical resolutions |
-| 5 | RapidDNS | Community DB | Scraped subdomains |
-| 6 | Wayback Machine | URL archive | Historical archived URLs |
-| 7 | ip.thc.org | Passive subdomains | The Hacker Choice DB |
-| 8 | bgp.he.net | Cert Transparency | Hurricane Electric CT logs |
+| 3 | CertSpotter | Cert Transparency | Independent CT mirror (redundancy when crt.sh 502s) |
+| 4 | HackerTarget | Passive DNS | Free hostsearch API |
+| 5 | AlienVault OTX | Passive DNS | Historical resolutions |
+| 6 | RapidDNS | Community DB | Scraped subdomains |
+| 7 | Wayback Machine | URL archive | Historical archived URLs |
+| 8 | ip.thc.org | Passive subdomains | The Hacker Choice DB |
+| 9 | bgp.he.net | Cert Transparency | Hurricane Electric CT logs |
 
-Plus two **active** stages that run after the passive sources:
+Plus **four active stages** that run after the passive sources:
 
 | Stage | Technique | Catches what passive misses |
 |-------|-----------|-----------------------------|
-| httpx brute force | ~500 curated service names, resolve+probe in one pass, status+title dedup | live hosts absent from every index (e.g. `mail`) |
-| Wayback link-crawl | fetch newest archived homepage, scrape links/assets | hosts never archived themselves but linked from the homepage |
+| **dnsx DNS brute** | Full SecLists 110k wordlist over DNS with wildcard-IP filter | Non-web subdomains (git, smtp, jenkins, redis, internal) that don't serve HTTP |
+| **Altdns permutations** | Numbered + modifier-cross-product + hyphen↔dot variants of known labels | Real-world compound names not in any wordlist: `staging-api`, `api-v2`, `dev-mail` |
+| httpx content-diff brute | ~500 curated service names, resolve+probe in one pass, status+title dedup with browser UA | Live hosts absent from every index; sees through Vercel/Cloudflare bot-walls |
+| Wayback link-crawl | Fetch newest archived pages of apex + www + top discovered hosts, scrape cross-links | Hosts never archived themselves but referenced from real pages |
 
 Source attribution: every result reports which source found which subdomain.
 

@@ -90,13 +90,17 @@ def _to_list(value) -> list[str]:
 def enumerate_subdomains(domain: str) -> dict:
     """Enumerate subdomains for a target domain.
 
-    Runs 8 passive intelligence sources in parallel, then an active httpx
-    brute-force pass (curated service wordlist + wildcard-noise filtering),
-    then a Wayback link-crawl. Uses a real browser User-Agent so hosts behind
-    Vercel/Cloudflare bot-walls are still discovered.
-
-    Args:
-        domain: root domain, e.g. 'example.com' (no protocol, no www)
+    Multi-stage pipeline:
+      1. subfinder -all (50+ passive sources)
+      2. 8 more passive APIs in parallel (crt.sh, CertSpotter, HackerTarget,
+         AlienVault OTX, RapidDNS, Wayback CDX, ip.thc.org, bgp.he.net)
+      3. dnsx DNS brute force over full 110k SecLists wordlist (finds
+         non-web subdomains like git/smtp/jenkins that HTTP probes miss)
+      4. Altdns-style permutation of discovered labels (finds compound
+         names like staging-api, api-v2, dev-mail not in any wordlist)
+      5. httpx content-diff brute (browser User-Agent sees through
+         Vercel/Cloudflare bot-walls) with wildcard-noise filtering
+      6. Wayback link-crawl on apex + www + top discovered hosts
 
     Returns: {'count': int, 'subdomains': list[str], 'sources_ok': list,
               'per_source': {...}, 'truncated': bool}
