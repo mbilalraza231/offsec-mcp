@@ -50,7 +50,7 @@ is the bridge.
 
 | MCP tool | Backed by | Fallback |
 |----------|-----------|----------|
-| `enumerate_subdomains(domain)` | subfinder -all + **10 passive APIs** (incl. **DuckDuckGo search dork** which finds brand-name hosts no wordlist can reach) + **dnsx 110k-wordlist DNS brute** (finds non-web subs like git/smtp/jenkins) + **Altdns-style permutation engine** (finds compound names like staging-api, api-v2) + **httpx content-diff brute** (browser-UA, sees through Vercel/Cloudflare) + Wayback crawl | all Python, no binary needed |
+| `enumerate_subdomains(domain)` | subfinder -all + **11 passive APIs** (incl. **2 search-engine dorks** — DuckDuckGo + Bing — which find brand-name hosts no wordlist can reach) + **dnsx 110k-wordlist DNS brute** (finds non-web subs like git/smtp/jenkins) + **Altdns-style permutation engine** (finds compound names like staging-api, api-v2) + **httpx content-diff brute** (browser-UA, sees through Vercel/Cloudflare) + Wayback crawl | all Python, no binary needed |
 | `resolve_subdomains(list)` | dnsx | dnspython |
 | `check_alive(list)` | httpx (browser-UA) | Python requests |
 | `scan_vulnerabilities(list)` | nuclei | none (clear error) |
@@ -60,9 +60,9 @@ is the bridge.
 | `list_installed_tools()` | runtime binary detection | — |
 | `list_previous_scans()` | reads `./output/` | — |
 
-### 10 Passive Sources (all free, no keys needed)
+### 11 Passive Sources (all free, no keys needed)
 
-The `enumerate_subdomains` tool queries **10 sources in parallel** using
+The `enumerate_subdomains` tool queries **11 sources in parallel** using
 ThreadPoolExecutor. Any single failure never blocks the pipeline.
 
 | # | Source | Type | What it finds |
@@ -71,12 +71,42 @@ ThreadPoolExecutor. Any single failure never blocks the pipeline.
 | 2 | crt.sh | Cert Transparency | All issued SSL certs |
 | 3 | CertSpotter | Cert Transparency | Independent CT mirror (redundancy when crt.sh 502s) |
 | 4 | **DuckDuckGo HTML dork** | **Search engine index** | **Brand-name hosts only visible in live links** (e.g. `zeenat.xinuty.com`) |
-| 5 | HackerTarget | Passive DNS | Free hostsearch API |
-| 6 | AlienVault OTX | Passive DNS | Historical resolutions |
-| 7 | RapidDNS | Community DB | Scraped subdomains |
-| 8 | Wayback Machine | URL archive | Historical archived URLs |
-| 9 | ip.thc.org | Passive subdomains | The Hacker Choice DB |
-| 10 | bgp.he.net | Cert Transparency | Hurricane Electric CT logs |
+| 5 | **Bing HTML dork** | **Search engine index** | **Different crawl slice — hosts DDG/Google miss** (e.g. `2a.xinuty.com`) |
+| 6 | HackerTarget | Passive DNS | Free hostsearch API |
+| 7 | AlienVault OTX | Passive DNS | Historical resolutions |
+| 8 | RapidDNS | Community DB | Scraped subdomains |
+| 9 | Wayback Machine | URL archive | Historical archived URLs |
+| 10 | ip.thc.org | Passive subdomains | The Hacker Choice DB |
+| 11 | bgp.he.net | Cert Transparency | Hurricane Electric CT logs |
+
+### Why we don't have 30 sources (honest answer)
+
+Bug bounty tools often advertise "50+ sources" — most are dead, need API
+keys, or rate-limit to 1 hit/day. When tested live, the following **all
+failed** on typical recon runs (returned 401/403/404, DNS resolution
+errors, or empty JSON):
+
+| Attempted | Status |
+|-----------|--------|
+| Chaos Project (`dns.projectdiscovery.io`) | 401 — moved to key-required |
+| Anubis (`jldc.me/anubis`) | returns HTML error page, JSON broken |
+| Riddings.io | domain not resolving |
+| Mnemonic PassivDNS | non-JSON response |
+| DNSGrep.cn | domain not resolving |
+| urlscan.io | 404/200 empty on free endpoint |
+| Mojeek | domain not resolving |
+| Startpage | 200 but 0 hosts (blocked) |
+| PublicWWW | 200 but 0 hosts (blocked) |
+| Brave Search | 429 rate-limited |
+| Qwant | 403 blocked |
+| Netcraft Site Report | domain not resolving |
+| Searchcode | domain not resolving |
+| CommonCrawl index | connection reset |
+| DNSDumpster | domain not resolving |
+
+That's 15 tried + 2 that work (DDG + Bing). Free is free — the good ones get crowded out.
+If you want MORE coverage, the upgrade path is **optional API keys**:
+VirusTotal, SecurityTrails, Netlas, BinaryEdge, Google Custom Search JSON.
 
 Plus **four active stages** that run after the passive sources:
 

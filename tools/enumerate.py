@@ -80,8 +80,8 @@ def enumerate_subdomains(domain: str) -> dict:
         except Exception as e:
             sources_fail.append(f"subfinder:{e.__class__.__name__}")
 
-    # --- 2-10. All HTTP passive sources in parallel ---
-    with ThreadPoolExecutor(max_workers=9) as pool:
+    # --- 2-11. All HTTP passive sources in parallel ---
+    with ThreadPoolExecutor(max_workers=10) as pool:
         future_map = {
             pool.submit(_fetch_with_retry, fn, domain, retries):
             (name, fn, retries)
@@ -444,6 +444,41 @@ def _duckduckgo(domain: str) -> set[str]:
     return out
 
 
+def _bing(domain: str) -> set[str]:
+    """Bing HTML search dork: `site:<domain> OR site:*.<domain>`.
+
+    Second search-engine index alongside DuckDuckGo. Every engine crawls
+    a slightly different slice of the web - Bing often has hosts Google
+    and DDG don't (and vice-versa), especially recently-published product
+    pages that index faster on Bing. Free, no API key (public HTML
+    endpoint, not the Azure Search API). Skips Bing's own URL-tracker
+    artifacts (`r.bing.com`, `www.bing.com/ck/`) that leak into our
+    hostname regex."""
+    resp = requests.get(
+        "https://www.bing.com/search",
+        params={"q": f"site:{domain} OR site:*.{domain}"},
+        timeout=TIMEOUT, headers=HEADERS,
+    )
+    if resp.status_code in (403, 429):
+        raise RuntimeError(f"bing rate-limited ({resp.status_code})")
+    resp.raise_for_status()
+    pattern = rf"(?:[a-zA-Z0-9_-]+\.)+{re.escape(domain)}"
+    out: set[str] = set()
+    for m in re.findall(pattern, resp.text):
+        host = m.lower().strip(".")
+        if not _is_valid_subdomain(host, domain):
+            continue
+        # Drop Bing's own redirect-tracker hostnames and CDN edge nodes
+        # that appear in <a href="..."> wrappers but aren't real target
+        # subdomains (e.g. `www.bing.com` when scanning `bing.com`).
+        if host.endswith(".bing.com") or host == "bing.com":
+            continue
+        if "bingcom" in host or "msedge" in host or "waws-prod" in host:
+            continue
+        out.add(host)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -480,6 +515,7 @@ PASSIVE_SOURCES = [
     ("crt.sh",         _crtsh,          3),
     ("certspotter",    _certspotter,    2),
     ("duckduckgo",     _duckduckgo,     2),
+    ("bing",           _bing,           2),
     ("hackertarget",   _hackertarget,   2),
     ("alienvault",     _alienvault,     2),
     ("rapiddns",       _rapiddns,       2),
