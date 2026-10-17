@@ -53,9 +53,13 @@ is the bridge.
 | `enumerate_subdomains(domain)` | subfinder -all + **11 passive APIs** (incl. **2 search-engine dorks** — DuckDuckGo + Bing — which find brand-name hosts no wordlist can reach) + **dnsx 110k-wordlist DNS brute** (finds non-web subs like git/smtp/jenkins) + **Altdns-style permutation engine** (finds compound names like staging-api, api-v2) + **httpx content-diff brute** (browser-UA, sees through Vercel/Cloudflare) + Wayback crawl | all Python, no binary needed |
 | `resolve_subdomains(list)` | dnsx | dnspython |
 | `check_alive(list)` | httpx (browser-UA) | Python requests |
+| `js_endpoints(urls, domain?)` | **NEW (Tier 1)** — deep-fetch HTML & JS on each alive URL, extract hidden hosts, API endpoints, potential leaked secrets (AWS keys, GitHub tokens, JWTs, PEMs, Stripe) | pure Python regex |
+| `sensitive_files(urls)` | **NEW (Tier 1)** — probe ~60 paths (`.git/HEAD`, `.env`, `backup.zip`, `/actuator/env`, `phpinfo.php`, `wp-config.bak`, `id_rsa`, `swagger.json`, `telescope`, etc.) with severity tags | pure Python HTTP |
+| `waf_fingerprint(subs)` | **NEW (Tier 2)** — 21 CDN/WAF signatures (Cloudflare, Vercel, Netlify, AWS CloudFront, Akamai, Fastly, Imperva, Sucuri, F5, GCP, GitHub Pages, Azure Front Door, Fly.io, Render, Heroku, …) | response headers only |
+| `wayback_urls(domain)` | **NEW (Tier 2)** — Wayback Machine CDX deep harvest; every archived URL & `interesting_urls` filtered for admin/api/backup/.env patterns | free CDX API |
 | `scan_vulnerabilities(list)` | nuclei | none (clear error) |
 | `check_takeover(list)` | pure Python CNAME fingerprint | — |
-| `full_recon(domain)` | all of the above, one call | — |
+| `full_recon(domain)` | **all of the above, 9-stage pipeline, one call** | — |
 | `save_results(domain, data)` | writes `./output/*.json` | — |
 | `list_installed_tools()` | runtime binary detection | — |
 | `list_previous_scans()` | reads `./output/` | — |

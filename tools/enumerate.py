@@ -179,16 +179,47 @@ def enumerate_subdomains(domain: str) -> dict:
 
     subs = sorted(collected)
 
+    # ---- Tier 3: confidence scoring ----
+    # Reverse-map source_detail so each sub knows WHICH sources reported it.
+    # A sub seen by 4 independent APIs is much more trustworthy than one seen
+    # by a single flaky source. Bug bounty triagers care about corroboration.
+    sources_by_sub: dict[str, list[str]] = {s: [] for s in subs}
+    for sname, slist in source_detail.items():
+        for sub in slist:
+            if sub in sources_by_sub:
+                sources_by_sub[sub].append(sname)
+    source_count = {sub: len(srcs) for sub, srcs in sources_by_sub.items()}
+
     # Cap the returned list to avoid overwhelming the LLM context window.
     # Full list is saved via save_results; model only sees first 30 + count.
     MAX_RETURN = 30
     display = subs[:MAX_RETURN] if len(subs) > MAX_RETURN else subs
+
+    # Per-sub detail bundle (host & which sources & corroboration count)
+    subdomain_details = [
+        {
+            "host": s,
+            "sources": sources_by_sub[s],
+            "source_count": source_count[s],
+        }
+        for s in display
+    ]
+
+    # Aggregate stats so the caller can see quality of the result set
+    confidence_summary = {
+        "single_source": sum(1 for c in source_count.values() if c == 1),
+        "multi_source": sum(1 for c in source_count.values() if c >= 2),
+        "corroborated_3plus": sum(1 for c in source_count.values() if c >= 3),
+    }
 
     return {
         "domain": domain,
         "count": len(subs),
         "showing": len(display),
         "subdomains": display,
+        "subdomain_details": subdomain_details,
+        "sources_by_sub": {s: sources_by_sub[s] for s in display},
+        "confidence_summary": confidence_summary,
         "truncated": len(subs) > MAX_RETURN,
         "sources_ok": sources_ok,
         "sources_failed": sources_fail,

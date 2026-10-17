@@ -14,6 +14,10 @@ from tools.vuln import scan_vulnerabilities as _scan
 from tools.alive import check_alive as _alive
 from tools.resolve import resolve_subdomains as _resolve
 from tools.enumerate import enumerate_subdomains as _enumerate
+from tools.js_harvest import harvest_javascript as _js_harvest
+from tools.sensitive import check_sensitive_files as _sensitive
+from tools.waf import fingerprint as _waf_fp
+from tools.archive import harvest_archived_urls as _archive_urls
 from mcp.server.mcpserver import MCPServer
 
 import json
@@ -40,12 +44,19 @@ types.CallToolRequestParams.model_validate = _patched_validate
 mcp = MCPServer(
     "offsec-mcp",
     instructions=(
-        "Free, local-first subdomain enumeration and recon toolkit. "
-        "Combines 8 passive sources (subfinder, crt.sh, AlienVault OTX, "
-        "Wayback, and more) with an active httpx brute-force pass that uses a "
-        "real browser User-Agent to see through Vercel/Cloudflare bot-walls. "
-        "Falls back to crt.sh / pure Python when binaries are missing. "
-        "Use only against domains you own or have written authorization to test."
+        "Free, local-first bug-bounty recon toolkit. "
+        "Subdomain enumeration combines subfinder + 11 passive APIs "
+        "(incl. DuckDuckGo + Bing search-engine dorks that find brand-name "
+        "hosts no wordlist can reach) with dnsx 110k-wordlist DNS brute + "
+        "Altdns-style permutations + httpx content-diff active verify "
+        "(browser User-Agent sees through Vercel/Cloudflare bot-walls). "
+        "Full pipeline adds JS-file harvesting (hidden hosts, endpoints, "
+        "secret patterns), sensitive-path probing (.git, .env, backups, "
+        "actuator) with severity tags, CDN/WAF fingerprinting on every "
+        "alive sub, Wayback Machine deep-URL archive harvest, subdomain "
+        "takeover detection, and nuclei vulnerability scan. Falls back "
+        "to pure Python when binaries are missing. Use only against "
+        "domains you own or have written authorization to test."
     ),
 )
 
@@ -173,29 +184,155 @@ def list_previous_scans() -> dict:
     return _list()
 
 
+@mcp.tool()
+def js_endpoints(urls: str | list[str], domain: str = "") -> dict:
+    """Deep-fetch HTML & JS files on live URLs; extract hidden hosts, endpoints,
+    and possible leaked secrets.
+
+    This is the technique top bug bounty hunters use daily. Real staging URLs,
+    internal API hosts, and leaked credentials are typically NOT in certs or
+    search indexes - they only live INSIDE the production JS bundle.
+
+    Args:
+        urls: list of alive URLs (from check_alive output). Cap 25 sites.
+        domain: OPTIONAL target-domain scope. When provided, only hosts on
+                that domain are reported (kills JS-method-name noise like
+                `a.id` that would otherwise look like hostnames). Recommended.
+
+    Returns:
+        {sites_scanned, js_files_scanned, subdomains_found, endpoints_found,
+         secrets_suspected (values truncated), per_site, errors}
+    """
+    return _js_harvest(_to_list(urls), domain=domain or None)
+
+
+@mcp.tool()
+def sensitive_files(urls: str | list[str]) -> dict:
+    """Probe ~60 sensitive paths (.git/HEAD, .env, backup.sql, phpinfo,
+    /actuator/env, wp-config.bak, swagger.json, id_rsa, ...) on live URLs.
+
+    Any 200 with real content is a bug-bounty reportable finding. Severity is
+    tagged per path (critical / high / medium / info).
+
+    Args:
+        urls: alive URLs to probe. Cap 25 sites.
+
+    Returns:
+        {urls_probed, paths_probed, total_checks, findings,
+         counts_by_severity, errors}
+    """
+    return _sensitive(_to_list(urls))
+
+
+@mcp.tool()
+def waf_fingerprint(subdomains: str | list[str]) -> dict:
+    """Detect CDN/WAF (Cloudflare, Vercel, Netlify, AWS CloudFront, Akamai,
+    Fastly, Imperva, Sucuri, F5, Google Cloud, GitHub Pages, Azure Front Door,
+    Fly.io, Render, etc.) on each subdomain from response headers.
+
+    Useful for choosing the right bypass technique and for tagging reports
+    so triagers can reproduce.
+
+    Args:
+        subdomains: hosts to probe. Cap 50.
+
+    Returns:
+        {fingerprints: [{subdomain, cdns_detected, server_header, ...}],
+         summary: {Cloudflare: N, Vercel: N, ...}}
+    """
+    return _waf_fp(_to_list(subdomains))
+
+
+@mcp.tool()
+def wayback_urls(domain: str) -> dict:
+    """Deep Wayback Machine harvest - return every URL archived on the target
+    domain (not just hosts). Flags interesting paths (api/admin/backup/etc.)
+    and sensitive extensions (.sql, .env, .bak, .zip, .pem).
+
+    Use case: finding deprecated API endpoints, historical config leaks,
+    old admin panels that were moved but never scrubbed from archive.
+
+    Args:
+        domain: apex domain (do NOT prefix `*.`).
+
+    Returns:
+        {total_archived_urls, unique_subdomains, interesting_urls,
+         sample_urls, note}
+    """
+    return _archive_urls(domain)
+
+
 # ---------- pipeline tool (money shot for the demo) ----------
 
 @mcp.tool()
 def full_recon(domain: str) -> dict:
-    """One-shot recon pipeline: enumerate -> resolve -> alive -> takeover -> nuclei.
+    """One-shot bug-bounty recon pipeline. Every stage, in one call.
 
-    This is the flagship tool for demos. Give it a domain, get a structured
-    recon report back in one call.
+    Chain:
+      1. enumerate_subdomains  (11 passive sources & 4 active stages)
+      2. resolve_subdomains    (dnsx / dnspython fallback)
+      3. check_alive           (httpx / requests, browser UA)
+      4. waf_fingerprint       (CDN/WAF per alive sub)
+      5. js_endpoints          (hidden hosts, endpoints, secrets from JS)
+      6. sensitive_files       (.git, .env, backup, actuator, etc.)
+      7. check_takeover        (dangling CNAMEs)
+      8. scan_vulnerabilities  (nuclei, if installed)
+      9. wayback_urls          (archived endpoints on the whole domain)
+
+    Returns one structured report. Saved automatically to ./output/.
     """
     enum = _enumerate(domain)
-    # Use the first 50 subs for pipeline (alive/resolve/takeover) to stay time-bounded
     subs = enum.get("subdomains", [])[:50]
-    total_found = enum.get("count", len(subs))  # Actual total from all sources
+    total_found = enum.get("count", len(subs))
     if not subs:
         return {"domain": domain, "error": "no subdomains found", "enum": enum}
 
-    resolved = _resolve(subs)
-    alive = _alive(subs)
-    takeover = _takeover(subs)
+    # Every optional stage is wrapped in _safe() so a single flaky source
+    # (Wayback 45s timeout, CertSpotter 429, mail.* self-signed cert, etc.)
+    # never kills the whole 9-stage pipeline. We prefer a partial report
+    # with `stage_errors` noting what failed over a total crash.
+    stage_errors: list[str] = []
 
-    urls = [a["url"] for a in alive.get("alive", [])]
-    # Cap nuclei at first 100 URLs to keep pipeline time-bounded
-    vulns = _scan(urls[:100]) if urls else {"findings": [], "count": 0}
+    def _safe(fn, name, default):
+        try:
+            return fn()
+        except Exception as e:
+            stage_errors.append(
+                f"{name}:{type(e).__name__}:{str(e)[:120]}"
+            )
+            return default
+
+    resolved = _safe(lambda: _resolve(subs), "resolve", {"resolved": {}})
+    alive = _safe(lambda: _alive(subs), "alive", {"alive": []})
+    alive_urls = [a["url"] for a in alive.get("alive", [])]
+
+    # Tier 2/1 additions run against the same alive set
+    waf = _safe(lambda: _waf_fp(subs), "waf_fingerprint",
+                {"fingerprints": [], "summary": {}})
+    js = _safe(
+        lambda: _js_harvest(alive_urls, domain=domain) if alive_urls
+        else {"sites_scanned": 0},
+        "js_endpoints",
+        {"sites_scanned": 0, "subdomains_found": [],
+         "endpoints_found": [], "secrets_suspected": []},
+    )
+    sensitive = _safe(
+        lambda: _sensitive(alive_urls) if alive_urls else {"findings": []},
+        "sensitive_files",
+        {"findings": [], "counts_by_severity": {}},
+    )
+    archive = _safe(
+        lambda: _archive_urls(domain), "wayback_urls",
+        {"total_archived_urls": 0, "interesting_urls": []},
+    )
+
+    takeover = _safe(lambda: _takeover(subs), "takeover",
+                     {"vulnerable": []})
+    vulns = _safe(
+        lambda: _scan(alive_urls[:100]) if alive_urls
+        else {"findings": [], "count": 0},
+        "nuclei", {"findings": [], "count": 0},
+    )
 
     report = {
         "domain": domain,
@@ -204,11 +341,42 @@ def full_recon(domain: str) -> dict:
         "subdomains_resolved": len(resolved.get("resolved", {})),
         "subdomains_alive": len(alive.get("alive", [])),
         "wildcard_catchall_filtered": alive.get("wildcard_catchall_count", 0),
+        "confidence_summary": enum.get("confidence_summary", {}),
+        "sources_used": enum.get("per_source", {}),
+        "sources_failed": enum.get("sources_failed", []),
+        "alive_details": alive.get("alive", [])[:10],
+        "waf_summary": waf.get("summary", {}),
+        "waf_details": waf.get("fingerprints", [])[:15],
+        "js_harvest": {
+            "sites_scanned": js.get("sites_scanned", 0),
+            "js_files_scanned": js.get("js_files_scanned", 0),
+            "extra_subdomains_found": js.get("subdomains_found", [])[:30],
+            "endpoints_found": js.get("endpoints_found", [])[:60],
+            "secrets_suspected": js.get("secrets_suspected", [])[:20],
+        },
+        "sensitive_findings": {
+            "total_checks": sensitive.get("total_checks", 0),
+            "counts_by_severity": sensitive.get("counts_by_severity", {}),
+            "top_findings": sensitive.get("findings", [])[:30],
+        },
+        "wayback_summary": {
+            "total_archived_urls": archive.get("total_archived_urls", 0),
+            "interesting_count": archive.get("interesting_count", 0),
+            "interesting_sample": archive.get("interesting_urls", [])[:30],
+            "error": archive.get("error"),
+        },
         "takeover_risks": takeover.get("vulnerable", []),
         "vulnerabilities": vulns,
-        "sources_used": enum.get("per_source", {}),
-        "alive_details": alive.get("alive", [])[:10],
+        "stage_errors": stage_errors,
+        "note": (
+            "If `stage_errors` is non-empty, some optional stages failed "
+            "but the pipeline continued. Every stage is wrapped in a "
+            "try/except so one flaky source never kills the whole run."
+        ) if stage_errors else None,
     }
+    # Drop None note field to keep response compact when nothing failed
+    if report.get("note") is None:
+        report.pop("note", None)
     _save(domain, report)
     return report
 
