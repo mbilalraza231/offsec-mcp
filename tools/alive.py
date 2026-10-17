@@ -21,6 +21,15 @@ from config import find_tool
 # through this code path.
 TIMEOUT = 15
 
+# Real browser User-Agent: CDN/WAF bot-walls (Vercel, Cloudflare) serve an
+# identical 403 challenge to non-browser UAs, which hides real hosts. A
+# browser UA elicits the true response so alive/dead and wildcard noise can
+# be told apart.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
 
 def check_alive(subdomains: list[str]) -> dict:
     if not subdomains:
@@ -34,7 +43,8 @@ def check_alive(subdomains: list[str]) -> dict:
             out = subprocess.check_output(
                 [httpx, "-silent", "-json", "-status-code",
                  "-title", "-follow-redirects", "-no-color",
-                 "-timeout", "8", "-retries", "2", "-threads", "30"],
+                 "-timeout", "8", "-retries", "2", "-threads", "30",
+                 "-H", f"User-Agent: {BROWSER_UA}"],
                 input=payload, stderr=subprocess.DEVNULL, timeout=TIMEOUT * 4,
             ).decode(errors="ignore")
             result = _parse_httpx(out, subdomains)
@@ -107,12 +117,13 @@ def _python_probe(subdomains: list[str]) -> dict:
     alive, dead = [], []
 
     def probe(sub: str):
+        headers = {"User-Agent": BROWSER_UA}
         for scheme in ("https", "http"):
             url = f"{scheme}://{sub}"
             # First attempt: strict TLS verification (safe default).
             try:
                 r = requests.get(url, timeout=6, verify=True,
-                                 allow_redirects=True)
+                                 allow_redirects=True, headers=headers)
                 return {"url": url, "status": r.status_code,
                         "title": _extract_title(r.text), "tls_verified": True}
             except requests.exceptions.SSLError:
@@ -120,7 +131,7 @@ def _python_probe(subdomains: list[str]) -> dict:
                 try:
                     with urllib3.disable_warnings():
                         r = requests.get(url, timeout=6, verify=False,
-                                         allow_redirects=True)
+                                         allow_redirects=True, headers=headers)
                     return {"url": url, "status": r.status_code,
                             "title": _extract_title(r.text), "tls_verified": False}
                 except Exception:

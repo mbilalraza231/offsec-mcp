@@ -100,29 +100,32 @@ A single request, step by step:
 
 ---
 
-## Known limitation: wildcard CDNs (Vercel, Cloudflare)
+## Wildcard CDN targets (Vercel, Cloudflare)
 
-Some targets put the **entire domain behind a wildcard CDN**. Every hostname
-— real *or* fake — returns an identical bot-check page:
+Some targets put the **entire domain behind a wildcard CDN**. With a default
+(non-browser) User-Agent these serve an identical bot-check page to every
+hostname — real *or* fake — which hides real subdomains:
 
 ```
-www.target.com       -> 403 "Vercel Security Checkpoint"
-some-random-xyz.com  -> 403 "Vercel Security Checkpoint"   (identical)
-real-hidden.com      -> 403 "Vercel Security Checkpoint"   (identical)
+# with a bot UA (broken view):
+real-hidden.com      -> 403 "Vercel Security Checkpoint"
+some-random-xyz.com  -> 403 "Vercel Security Checkpoint"   (identical -> lost)
 ```
 
-A subdomain only reachable this way (e.g. `restaurant.target.com`) is
-**undetectable by every recon tool**, because over the wire it is
-byte-identical to a made-up name. Keeping it would also mean keeping hundreds
-of fake names — so the noise filter correctly discards it.
+**This tool sends a real browser User-Agent on every HTTP probe**, so the CDN
+returns the true response and real vs fake separate cleanly:
 
-The only ways such a host can surface:
-1. **Wayback Machine** — if it was archived *before* the CDN bot-wall existed
-   (we already query it as source #6).
-2. **Certificate Transparency** — if it ever had its own (non-wildcard) cert.
-3. **The asset owner's internal list** — not public at all.
+```
+# with a browser UA (what offsec-mcp does):
+restaurant.target.com   -> 200 "...real page..."            (kept)
+some-random-xyz.com     -> 404 x-vercel-error=DEPLOYMENT_NOT_FOUND (dropped)
+```
 
-This is a property of the target's infrastructure, not a gap in this tool.
+The `status + title` dedup then keeps the distinct 200 pages and discards the
+uniform 404/catch-all noise. A host stays hidden **only if** all three hold:
+no certificate-transparency entry, no Wayback archive, and the CDN answers
+every name identically even to a browser. That residual case is a property of
+the target's infrastructure, not a gap in this tool.
 
 
 ## Install

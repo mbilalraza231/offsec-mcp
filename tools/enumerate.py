@@ -32,7 +32,16 @@ import requests
 from config import find_tool
 
 TIMEOUT = 25
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; offsec-mcp/1.0)"}
+# A real browser User-Agent. Many CDN/WAF bot-walls (Vercel Security
+# Checkpoint, Cloudflare) return an identical 403 challenge to non-browser
+# UAs, masking real subdomains as noise. A browser UA gets the true response:
+# real host -> 200 + unique page, non-existent -> 404 (e.g. Vercel
+# 'DEPLOYMENT_NOT_FOUND'), which our status+title dedup can then separate.
+BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+HEADERS = {"User-Agent": BROWSER_UA}
 
 # No brute-force. Only passive intelligence sources (no false positives).
 # Sources defined after PASSIVE_SOURCES below.
@@ -416,7 +425,8 @@ def _httpx_probe(httpx: str, hosts: list[str], timeout: int) -> dict:
         out = subprocess.check_output(
             [httpx, "-silent", "-json", "-status-code", "-title",
              "-content-length", "-follow-redirects", "-no-color",
-             "-timeout", "5", "-retries", "2", "-threads", "150"],
+             "-timeout", "5", "-retries", "2", "-threads", "150",
+             "-H", f"User-Agent: {BROWSER_UA}"],
             input=payload, stderr=subprocess.DEVNULL, timeout=timeout,
         ).decode(errors="ignore")
         for line in out.splitlines():
