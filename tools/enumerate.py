@@ -105,10 +105,13 @@ def enumerate_subdomains(domain: str) -> dict:
     # ---- 7. Active DNS brute (dnsx over full 110k wordlist) ----
     # Catches non-web subdomains (git, smtp, jenkins, redis, internal
     # tools) that have an A record but no HTTP server -> invisible to
-    # httpx content-diff. Wildcard-aware via IP-pool filter.
+    # httpx content-diff. Skipped automatically when the target has
+    # wildcard DNS (see _dnsx_brute docstring for why).
     dnsx_words = _load_words_full()
-    dnsx_hits = _dnsx_brute(domain, dnsx_words)
-    if dnsx_hits:
+    dnsx_hits, dnsx_wildcard = _dnsx_brute(domain, dnsx_words)
+    if dnsx_wildcard:
+        sources_fail.append("dnsx-brute:wildcard-skip")
+    elif dnsx_hits:
         new = dnsx_hits - collected
         collected |= dnsx_hits
         if new:
@@ -122,10 +125,13 @@ def enumerate_subdomains(domain: str) -> dict:
     # ---- 8. Altdns-style permutations (compound names not in wordlists) ----
     # Take every label discovered so far (from passive + dnsx) and generate
     # api1/api-1/dev-api/staging-api etc. Then verify via dnsx (fast).
+    # Same wildcard-skip rule as _dnsx_brute above.
     perms = _permutations(collected, domain)
     if perms:
-        perm_hits = _dnsx_brute(domain, perms, timeout=60)
-        if perm_hits:
+        perm_hits, perm_wildcard = _dnsx_brute(domain, perms, timeout=60)
+        if perm_wildcard:
+            sources_fail.append("permutations:wildcard-skip")
+        elif perm_hits:
             new = perm_hits - collected
             collected |= perm_hits
             if new:
@@ -656,21 +662,27 @@ def _run_dnsx(dnsx: str, hosts: list[str], timeout: int) -> dict:
     return result
 
 
-def _dnsx_brute(domain: str, words: list[str], timeout: int = 180) -> set[str]:
-    """Brute force DNS resolution over a large wordlist, wildcard-aware.
+def _dnsx_brute(domain: str, words: list[str],
+                timeout: int = 180) -> tuple[set[str], bool]:
+    """Brute force DNS resolution over a large wordlist.
+
+    Returns (hits, has_wildcard).
 
     Wildcard handling: probe 5 random nonsense names first.
       - none resolve  -> domain has NO wildcard DNS. Every resolved
         candidate from the wordlist is a REAL hit.
-      - all resolve   -> wildcard DNS is on. Collect the wildcard IP pool,
-        then keep ONLY candidates whose IPs fall outside that pool (i.e.
-        truly different infrastructure). Same-IP candidates are noise.
+      - all resolve   -> wildcard DNS is on. DNS alone cannot tell a
+        real sub (e.g. restaurant.host) from a fake one (e.g. xyz.host)
+        when both route through a CDN with a large shared IP pool. The
+        only reliable signal is HTTP content-diff (which the downstream
+        httpx stage handles). So we return an empty hit set and let the
+        caller log the skip reason.
     """
     import random
     import string
     dnsx = find_tool("dnsx")
     if not dnsx or not words:
-        return set()
+        return set(), False
 
     baseline = [
         f"{''.join(random.choices(string.ascii_lowercase, k=12))}.{domain}"
@@ -678,23 +690,25 @@ def _dnsx_brute(domain: str, words: list[str], timeout: int = 180) -> set[str]:
     ]
     baseline_res = _run_dnsx(dnsx, baseline, timeout=15)
     has_wildcard = bool(baseline_res)
-    wildcard_ips: set[str] = set()
-    for host, ips in baseline_res.items():
-        wildcard_ips.update(ips)
+    if has_wildcard:
+        # Wildcard + CDN IP pool makes DNS-only filtering unreliable.
+        # The 5 baseline probes sample only a fraction of the pool; any
+        # candidate that hits a not-yet-seen IP would be wrongly kept as
+        # "real" (we've seen this generate 9 false www-<modifier> hits
+        # on a Vercel-fronted domain). Skip and let HTTP verify handle it.
+        return set(), True
 
     candidates = [f"{w}.{domain}" for w in words]
     resolved = _run_dnsx(dnsx, candidates, timeout=timeout)
 
     out: set[str] = set()
-    for host, ips in resolved.items():
+    for host, _ips in resolved.items():
         if host in baseline:
             continue
         if not _is_valid_subdomain(host, domain):
             continue
-        if has_wildcard and wildcard_ips and set(ips).issubset(wildcard_ips):
-            continue  # wildcard noise -> identical IP pool
         out.add(host)
-    return out
+    return out, False
 
 
 def _permutations(known_subs: set[str], domain: str,
