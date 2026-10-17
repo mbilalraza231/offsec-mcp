@@ -50,7 +50,7 @@ is the bridge.
 
 | MCP tool | Backed by | Fallback |
 |----------|-----------|----------|
-| `enumerate_subdomains(domain)` | subfinder -all + **9 passive APIs** + **dnsx 110k-wordlist DNS brute** (finds non-web subs like git/smtp/jenkins) + **Altdns-style permutation engine** (finds compound names like staging-api, api-v2) + **httpx content-diff brute** (browser-UA, sees through Vercel/Cloudflare) + Wayback crawl | all Python, no binary needed |
+| `enumerate_subdomains(domain)` | subfinder -all + **10 passive APIs** (incl. **DuckDuckGo search dork** which finds brand-name hosts no wordlist can reach) + **dnsx 110k-wordlist DNS brute** (finds non-web subs like git/smtp/jenkins) + **Altdns-style permutation engine** (finds compound names like staging-api, api-v2) + **httpx content-diff brute** (browser-UA, sees through Vercel/Cloudflare) + Wayback crawl | all Python, no binary needed |
 | `resolve_subdomains(list)` | dnsx | dnspython |
 | `check_alive(list)` | httpx (browser-UA) | Python requests |
 | `scan_vulnerabilities(list)` | nuclei | none (clear error) |
@@ -60,9 +60,9 @@ is the bridge.
 | `list_installed_tools()` | runtime binary detection | — |
 | `list_previous_scans()` | reads `./output/` | — |
 
-### 9 Passive Sources (all free, no keys needed)
+### 10 Passive Sources (all free, no keys needed)
 
-The `enumerate_subdomains` tool queries **9 sources in parallel** using
+The `enumerate_subdomains` tool queries **10 sources in parallel** using
 ThreadPoolExecutor. Any single failure never blocks the pipeline.
 
 | # | Source | Type | What it finds |
@@ -70,12 +70,13 @@ ThreadPoolExecutor. Any single failure never blocks the pipeline.
 | 1 | subfinder (binary, `-all`) | 50+ APIs merged | Massive passive coverage |
 | 2 | crt.sh | Cert Transparency | All issued SSL certs |
 | 3 | CertSpotter | Cert Transparency | Independent CT mirror (redundancy when crt.sh 502s) |
-| 4 | HackerTarget | Passive DNS | Free hostsearch API |
-| 5 | AlienVault OTX | Passive DNS | Historical resolutions |
-| 6 | RapidDNS | Community DB | Scraped subdomains |
-| 7 | Wayback Machine | URL archive | Historical archived URLs |
-| 8 | ip.thc.org | Passive subdomains | The Hacker Choice DB |
-| 9 | bgp.he.net | Cert Transparency | Hurricane Electric CT logs |
+| 4 | **DuckDuckGo HTML dork** | **Search engine index** | **Brand-name hosts only visible in live links** (e.g. `zeenat.xinuty.com`) |
+| 5 | HackerTarget | Passive DNS | Free hostsearch API |
+| 6 | AlienVault OTX | Passive DNS | Historical resolutions |
+| 7 | RapidDNS | Community DB | Scraped subdomains |
+| 8 | Wayback Machine | URL archive | Historical archived URLs |
+| 9 | ip.thc.org | Passive subdomains | The Hacker Choice DB |
+| 10 | bgp.he.net | Cert Transparency | Hurricane Electric CT logs |
 
 Plus **four active stages** that run after the passive sources:
 

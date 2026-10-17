@@ -80,8 +80,8 @@ def enumerate_subdomains(domain: str) -> dict:
         except Exception as e:
             sources_fail.append(f"subfinder:{e.__class__.__name__}")
 
-    # --- 2-9. All HTTP passive sources in parallel ---
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    # --- 2-10. All HTTP passive sources in parallel ---
+    with ThreadPoolExecutor(max_workers=9) as pool:
         future_map = {
             pool.submit(_fetch_with_retry, fn, domain, retries):
             (name, fn, retries)
@@ -404,6 +404,46 @@ def _certspotter(domain: str) -> set[str]:
     return out
 
 
+def _duckduckgo(domain: str) -> set[str]:
+    """DuckDuckGo HTML search dork: `site:<domain> OR site:*.<domain>`.
+
+    This surfaces subdomains Google/DDG has *indexed from live links*
+    but that are missing from every cert-transparency / passive-DNS /
+    Wayback source. Real bug bounty hunters use this exact query
+    manually; automating it is a large coverage gain on wildcard-CDN
+    targets (custom brand names like `zeenat.xinuty.com` never appear
+    in any wordlist or cert, only in pages that linked to them).
+
+    Uses the html.duckduckgo.com HTML endpoint (no API key, unlike
+    Google's Custom Search JSON). Skips redirect-wrapped result URLs
+    whose hostnames look like `2Fxxx.domain.com` (those are percent-
+    encoded slashes from DDG's `/l/?uddg=` link wrapper leaking into
+    our regex - the clean form also appears in the same results)."""
+    url = "https://html.duckduckgo.com/html/"
+    resp = requests.get(
+        url,
+        params={"q": f"site:{domain} OR site:*.{domain}"},
+        timeout=TIMEOUT, headers=HEADERS,
+    )
+    if resp.status_code == 403:
+        raise RuntimeError("duckduckgo rate-limited (403)")
+    resp.raise_for_status()
+    pattern = rf"(?:[a-zA-Z0-9_-]+\.)+{re.escape(domain)}"
+    out: set[str] = set()
+    for m in re.findall(pattern, resp.text):
+        host = m.lower().strip(".")
+        first_label = host.split(".")[0]
+        # DDG wraps outbound links with %2F URL-encoded slashes. When our
+        # regex grabs the string without decoding, the leading "2F" shows
+        # up as part of the first label. Skip those; the clean host also
+        # appears elsewhere in the same HTML.
+        if re.fullmatch(r"2f[a-z0-9_-]+", first_label):
+            continue
+        if _is_valid_subdomain(host, domain):
+            out.add(host)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -439,6 +479,7 @@ def _is_valid_hostname(host: str) -> bool:
 PASSIVE_SOURCES = [
     ("crt.sh",         _crtsh,          3),
     ("certspotter",    _certspotter,    2),
+    ("duckduckgo",     _duckduckgo,     2),
     ("hackertarget",   _hackertarget,   2),
     ("alienvault",     _alienvault,     2),
     ("rapiddns",       _rapiddns,       2),
