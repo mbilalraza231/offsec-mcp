@@ -1,11 +1,9 @@
 # offsec-mcp
 
-**A local-first MCP server for subdomain enumeration and passive recon.**
-
-Wraps the popular free tools every bug bounty hunter already uses —
-**subfinder**, **httpx**, **dnsx**, **nuclei** — and exposes them as
-Model Context Protocol tools so any MCP client (LlamaFile, Claude Desktop,
-Cursor, Cline, Continue) can drive them with a local LLM.
+**MCP server for bug bounty recon.** Enumerate subdomains, hunt JS
+leaks, fingerprint WAFs, detect takeovers, probe sensitive files, &
+scan with nuclei — from any local LLM or MCP client (LlamaFile,
+Claude Desktop, Cursor, Cline, Continue).
 
 No cloud APIs. No API keys. No telemetry. Everything runs on your machine.
 
