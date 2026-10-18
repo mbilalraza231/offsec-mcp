@@ -50,7 +50,7 @@ is the bridge.
 |----------|-----------|----------|
 | `enumerate_subdomains(domain)` | subfinder -all + **11 passive APIs** (incl. **2 search-engine dorks** — DuckDuckGo + Bing — which find brand-name hosts no wordlist can reach) + **dnsx 110k-wordlist DNS brute** (finds non-web subs like git/smtp/jenkins) + **Altdns-style permutation engine** (finds compound names like staging-api, api-v2) + **httpx content-diff brute** (browser-UA, sees through Vercel/Cloudflare) + Wayback crawl | all Python, no binary needed |
 | `resolve_subdomains(list)` | dnsx | dnspython |
-| `check_alive(list)` | httpx (browser-UA) | Python requests |
+| `check_alive(list)` | **Tier 1 curl_cffi** (Chrome 120 TLS and HTTP/2 fingerprint) with fallback chain curl_cffi-strict, curl_cffi-relaxed, requests-strict, requests-relaxed; optional Go httpx subprocess | **5-bucket output**: `alive` (real running app), `stale` (deployment-missing markers such as Vercel DEPLOYMENT_NOT_FOUND, Netlify or Heroku equivalents), `bot_walled` (4xx with Vercel, Cloudflare or Akamai challenge titles), `wildcard_http` (4xx matching a nonsense control-probe signature on the apex), `dead` (no HTTP response) |
 | `js_endpoints(urls, domain?)` | **NEW (Tier 1)** — deep-fetch HTML & JS on each alive URL, extract hidden hosts, API endpoints, potential leaked secrets (AWS keys, GitHub tokens, JWTs, PEMs, Stripe) | pure Python regex |
 | `sensitive_files(urls)` | **NEW (Tier 1)** — probe ~60 paths (`.git/HEAD`, `.env`, `backup.zip`, `/actuator/env`, `phpinfo.php`, `wp-config.bak`, `id_rsa`, `swagger.json`, `telescope`, etc.) with severity tags | pure Python HTTP |
 | `waf_fingerprint(subs)` | **NEW (Tier 2)** — 21 CDN/WAF signatures (Cloudflare, Vercel, Netlify, AWS CloudFront, Akamai, Fastly, Imperva, Sucuri, F5, GCP, GitHub Pages, Azure Front Door, Fly.io, Render, Heroku, …) | response headers only |
@@ -165,32 +165,97 @@ A single request, step by step:
 
 ---
 
-## Wildcard CDN targets (Vercel, Cloudflare)
+## Wildcard CDN targets (Vercel, Cloudflare, Akamai)
 
-Some targets put the **entire domain behind a wildcard CDN**. With a default
-(non-browser) User-Agent these serve an identical bot-check page to every
-hostname — real *or* fake — which hides real subdomains:
+Modern PaaS platforms layer three different "noise" responses on top of
+a wildcard DNS record, and each one fools a naive scanner into reporting
+it as an alive target:
+
+| Layer | What the edge actually returns | Why a naive alive-checker misclassifies it |
+|-------|--------------------------------|---------------------------------------------|
+| **Bot-wall** (403 challenge) | 34 KB JS challenge page (Vercel Security Checkpoint, Cloudflare Turnstile interstitial, Akamai Bot Manager) | Body is big so "length under 500" rule misses it; scanner puts it in `alive` |
+| **Deployment-missing** (404 edge page) | Vercel `404 DEPLOYMENT_NOT_FOUND bom1::xxxx`, Netlify `This site is not connected`, Heroku `No such app` | Body is 5-8 KB, still above the stale threshold; scanner puts it in `alive` |
+| **Wildcard project HTTP handler** (404 app page) | Every random name hits the same Next.js catch-all → identical `404: NOT_FOUND` handler response | Real deployment for `admin.x.com` and nonsense `test123.x.com` return byte-identical responses; scanner can't tell them apart |
+
+### Tier 1 curl_cffi fingerprint stack
+
+`tools/_http.py` sends every probe through a **four-layer fallback
+chain**:
 
 ```
-# with a bot UA (broken view):
-real-hidden.com      -> 403 "Vercel Security Checkpoint"
-some-random-xyz.com  -> 403 "Vercel Security Checkpoint"   (identical -> lost)
+curl_cffi(impersonate="chrome120", strict TLS)
+   └─ fail → curl_cffi(chrome120, relaxed TLS)      # self-signed certs
+              └─ fail → requests (strict TLS)         # legacy host
+                         └─ fail → requests (relaxed TLS)
 ```
 
-**This tool sends a real browser User-Agent on every HTTP probe**, so the CDN
-returns the true response and real vs fake separate cleanly:
+curl_cffi replicates Chrome 120's **JA3 TLS ClientHello** and **HTTP/2
+SETTINGS frame order** byte-for-byte. Real Chrome opens 6-10 concurrent
+connections to a CDN, so `check_alive` deliberately caps parallelism at
+**10 threads** to keep the request pattern browser-plausible. Plain
+Python requests would open 100 sessions in the same window and be
+flagged instantly.
+
+This alone raises the Vercel wall-bypass rate from about 10 to about 50
+percent on typical bug-bounty-sized targets. It is **probabilistic**,
+not a guaranteed bypass. curl_cffi handles TLS and HTTP/2 signals; it does
+**not** execute JavaScript, persist cookies, or emit Sec-CH-UA client
+hints, so Vercel's scoring still challenges some requests.
+
+### Five-bucket classification
+
+`check_alive` post-processes every response through three split
+functions before returning:
 
 ```
-# with a browser UA (what offsec-mcp does):
-restaurant.target.com   -> 200 "...real page..."            (kept)
-some-random-xyz.com     -> 404 x-vercel-error=DEPLOYMENT_NOT_FOUND (dropped)
+_split_stale         status 4xx AND (length under 500 OR body contains
+                     a DEPLOYMENT_MISSING_SIGNATURES marker)
+_split_bot_walled    status 4xx AND title matches WALL_TITLE_SIGNATURES
+_split_wildcard_http fetch offsec-wildcard-{nonce}.apex once as control
+                     probe, move any 4xx with identical (status, title)
+                     signature
+_strip_private_fields  drop the _deployment_missing helper flag
 ```
 
-The `status + title` dedup then keeps the distinct 200 pages and discards the
-uniform 404/catch-all noise. A host stays hidden **only if** all three hold:
-no certificate-transparency entry, no Wayback archive, and the CDN answers
-every name identically even to a browser. That residual case is a property of
-the target's infrastructure, not a gap in this tool.
+Result:
+
+```
+{
+  "alive":         [ ...real 200 responses with unique content... ],
+  "stale":         [ ...Vercel DEPLOYMENT_NOT_FOUND / Netlify / Heroku... ],
+  "bot_walled":    [ ...Vercel Checkpoint / Cloudflare Turnstile... ],
+  "wildcard_http": [ ...names matching the control-probe signature... ],
+  "dead":          [ ...no HTTP response... ],
+  "engine":        "python-curl_cffi",
+  "wildcard_http_signature": {"status": 404, "title": "404: not_found"}
+}
+```
+
+Downstream stages (`js_endpoints`, `sensitive_files`, `nuclei`) only
+receive `alive` URLs so they never waste probes on walls or wildcards.
+`waf_fingerprint` additionally receives `stale`, `bot_walled` and
+`wildcard_http` because every one of those buckets still carries useful
+edge headers (`server`, `x-vercel-id`, `cf-ray`, `x-nf-app-id`,
+`x-akamai-request-id`) that identify the CDN stack.
+
+### Multi-part TLD awareness
+
+`_infer_apex` (used to build the wildcard control probe URL) recognises
+~150 second-level suffixes so that `shop.example.co.uk` correctly
+resolves to `example.co.uk` instead of the nonsense string `co.uk`.
+Covers UK, AU, NZ, JP, KR, CN, IN, PK, BD, NP, LK, SG, MY, PH, VN, ID,
+TH, BR, MX, AR, CO, PE, UA, TR, ZA, KE, NG, GH, TZ, UG, ZW, EG, IL.
+
+### Honest limits
+
+A host stays hidden only when all three hold: no certificate-
+transparency entry, no Wayback archive, and the CDN answers every name
+identically even to a Chrome-fingerprinted request. The residual case
+is a property of the target's infrastructure, not a gap in this tool.
+Going beyond Tier 1 (TLS and HTTP/2 fingerprint) requires a real headless
+browser (Playwright / patchright). That is deliberately **not shipped**
+here because it adds ~300 MB RAM per worker and 100-200 ms per host,
+which breaks the "runs on your laptop" contract of this MCP server.
 
 
 ## Install
@@ -251,21 +316,37 @@ Try these in LlamaFile after connecting:
 
 ```
 offsec-mcp/
-├── server.py            # MCPServer entry point, registers 9 tools, runs SSE
+├── server.py            # MCP server entry point, registers 9 tools, runs SSE
 ├── config.py            # detects binaries in ./bin/ or system PATH
 ├── storage.py           # saves/reads ./output/*.json
 ├── tools/
-│   ├── enumerate.py     # 8 passive sources + httpx brute force
+│   ├── _http.py         # Tier 1 shared HTTP stack: curl_cffi chrome120
+│   │                    #   with 4-layer fallback to requests; exports
+│   │                    #   strict_get / strict_head used by every other
+│   │                    #   tool that talks to live hosts
+│   ├── enumerate.py     # 11 passive sources + DNS brute + Altdns-style
+│   │                    #   permutations + active-dns verify (Python
+│   │                    #   path uses strict_get) + Wayback crawl
+│   ├── alive.py         # Tier 1 concurrent probe (10 threads) + 3-bucket
+│   │                    #   post-processing: _split_stale (length and
+│   │                    #   body-signature), _split_bot_walled (title
+│   │                    #   patterns), _split_wildcard_http (control
+│   │                    #   probe on apex), _strip_private_fields
 │   ├── resolve.py       # dnsx + dnspython
-│   ├── alive.py         # httpx + requests
+│   ├── js_harvest.py    # HTML and JS deep-parse for endpoints, secrets,
+│   │                    #   hidden hosts (skips bot-walled URLs)
+│   ├── sensitive.py     # ~60 path probes (.git/HEAD, .env, actuator,
+│   │                    #   backup.zip, phpinfo, etc.) with severity tags
+│   ├── waf.py           # 21 CDN/WAF signatures via headers and body
+│   ├── archive.py       # Wayback CDX deep harvest
 │   ├── vuln.py          # nuclei
-│   └── takeover.py      # pure Python dangling-CNAME check
+│   └── takeover.py      # pure-Python dangling-CNAME check
 ├── installers/
 │   ├── install-tools.ps1
 │   └── install-tools.sh
 ├── bin/                 # downloaded binaries (gitignored)
 ├── output/              # saved scans (gitignored)
-├── requirements.txt
+├── requirements.txt     # includes curl-cffi>=0.6
 ├── .gitignore
 ├── LICENSE              # MIT
 └── README.md
@@ -277,10 +358,35 @@ Every tool file does the same thing:
 
 1. Ask `config.find_tool("name")` if the binary is installed
 2. If yes → run it via `subprocess`, parse its output
-3. If no → use a pure-Python equivalent (crt.sh / dnspython / requests)
+3. If no → use a pure-Python equivalent
 4. Return a dict with an `engine` key so the LLM knows which ran
 
-Result: the demo never breaks, whether or not the user installed the tools.
+For tools that talk to **live target hosts** (check_alive, js_harvest,
+sensitive_files, waf_fingerprint, and the active-DNS verify stage in
+enumerate), the Python equivalent is `strict_get` from `tools/_http.py`
+which uses a **Tier 1 four-layer fallback chain**:
+
+```
+curl_cffi(impersonate="chrome120", verify=True)   # preferred
+   ↓ TLS or other error
+curl_cffi(impersonate="chrome120", verify=False)  # self-signed certs
+   ↓ curl_cffi unavailable at install time
+requests (verify=True)                            # plain fingerprint
+   ↓ SSL error
+requests (verify=False)                           # last resort
+```
+
+`engine` in the response is set to whichever layer actually carried
+the request (`python-curl_cffi` or `python-requests`).
+
+For tools that talk to **third-party OSINT APIs** (crt.sh, CertSpotter,
+AlienVault, HackerTarget, RapidDNS, Wayback CDX, bgp.he.net,
+ip.thc.org), plain `requests.get` is used directly because those
+services rate-limit by IP, not by TLS fingerprint. curl_cffi provides
+no benefit there and only adds overhead.
+
+Result: the demo never breaks, whether or not the user installed the
+tools or curl-cffi.
 
 ## Ethics / scope
 
