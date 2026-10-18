@@ -32,6 +32,29 @@ import requests
 from config import find_tool
 
 TIMEOUT = 25
+
+# Small, curated list of labels we know real organisations almost always
+# stand up on their OWN infrastructure (different IP or CNAME than the
+# wildcard pool). Used as a last-resort probe when dnsx-brute is
+# wildcard-skipped, so we still catch mail / cpanel / admin etc. on
+# targets like xinuty.com where *.domain resolves to a Vercel edge pool
+# but mail.domain has a CNAME to a totally separate webmail host.
+# Kept to 40 labels: pure-DNS probes, ~1-2s wall time, high hit-rate.
+CURATED_MUST_PROBE = (
+    # mail / hosting
+    "mail", "webmail", "smtp", "imap", "pop", "mx", "autodiscover",
+    # control panels
+    "cpanel", "whm", "webdisk", "directadmin", "plesk",
+    # lifecycle envs
+    "dev", "staging", "stage", "test", "uat", "beta", "preview",
+    # auth / admin surfaces
+    "admin", "dashboard", "portal", "api", "auth", "sso", "oauth",
+    # dev infra
+    "git", "gitlab", "gitea", "wiki", "docs", "status", "jenkins",
+    # network / storage
+    "cdn", "ftp", "sftp", "static", "assets", "files",
+)
+
 # A real browser User-Agent. Many CDN/WAF bot-walls (Vercel Security
 # Checkpoint, Cloudflare) return an identical 403 challenge to non-browser
 # UAs, masking real subdomains as noise. A browser UA gets the true response:
@@ -160,6 +183,24 @@ def enumerate_subdomains(domain: str) -> dict:
         source_detail["active-dns"] = sorted(active)
         sources_ok.append(f"active-dns({len(active)})")
 
+    # ---- 9.5. Curated must-probe (bypass wildcard-skip) ----
+    # When dnsx-brute is wildcard-skipped we still need to catch hosts
+    # like mail, webmail, cpanel that live on totally SEPARATE infra
+    # (different IP or CNAME than the wildcard pool) and would otherwise
+    # be missed. Cheap: ~40 DNS queries, ~2s wall time. Also useful when
+    # dnsx binary is not installed at all - fills the gap it would cover.
+    wild_ips, wild_cnames = _discover_wildcard_pool(domain)
+    wildcard_detected = bool(wild_ips or wild_cnames)
+    must_hits = _curated_must_probe(domain, wild_ips, wild_cnames)
+    new = must_hits - collected
+    if new:
+        collected |= new
+        source_detail["must-probe"] = sorted(new)
+        sources_ok.append(f"must-probe({len(new)})")
+    else:
+        sources_fail.append(
+            "must-probe:no-new" if wildcard_detected else "must-probe:empty")
+
     # ---- 10. Wayback link-crawl with widened seed list ----
     # Seed from apex + www + up to 4 discovered hosts, so archived pages
     # on ANY known sub (not just base domain) contribute cross-links.
@@ -236,6 +277,11 @@ def enumerate_subdomains(domain: str) -> dict:
         "sources_by_sub": {s: sources_by_sub[s] for s in display},
         "confidence_summary": confidence_summary,
         "truncated": len(subs) > MAX_RETURN,
+        # Wildcard DNS signal: True means *.domain resolves to a shared
+        # pool. Users should trust HTTP content-diff over raw counts because
+        # fake names will look real on DNS alone.
+        "wildcard_dns": wildcard_detected,
+        "wildcard_ip_pool": sorted(wild_ips)[:8],  # bounded for LLM context
         "sources_ok": sources_ok,
         "sources_failed": sources_fail,
         "per_source": {k: len(v) for k, v in source_detail.items()},
@@ -252,12 +298,40 @@ def _crtsh(domain: str) -> set[str]:
 
     crt.sh is notoriously slow on huge targets (Tesla, Google, Microsoft).
     Tesla alone has ~15k certs; response body can be 20MB+. We give crt.sh
-    a 60s timeout instead of the shared TIMEOUT (25s)."""
+    a 60s timeout instead of the shared TIMEOUT (25s).
+
+    Internal retry (2 attempts, 4s sleep) on empty JSON list. crt.sh
+    frequently returns `[]` under transient load even when records exist;
+    a fresh request a few seconds later typically succeeds. The outer
+    `_fetch_with_retry` wrapper doesn't help here because it only retries
+    when the function RAISES; an empty list is a silent failure. We only
+    retry on empty or JSON-decode errors (crt.sh sometimes returns an HTML
+    error page that fails to parse). Real HTTP / network errors propagate
+    so the caller's exception handling stays in control."""
     url = f"https://crt.sh/?q={quote('%.' + domain)}&output=json"
-    resp = requests.get(url, timeout=60, headers=HEADERS)
-    resp.raise_for_status()
+    data = None
+    for attempt in (1, 2):
+        try:
+            resp = requests.get(url, timeout=60, headers=HEADERS)
+            resp.raise_for_status()
+            try:
+                data = resp.json()
+            except ValueError:
+                # HTML error page: retry once
+                if attempt < 2:
+                    time.sleep(4)
+                    continue
+                data = []
+            if isinstance(data, list) and len(data) > 0:
+                break  # got real results
+            # empty list: retry once
+            if attempt < 2:
+                time.sleep(4)
+                continue
+        except requests.exceptions.RequestException:
+            raise
     out: set[str] = set()
-    for entry in resp.json():
+    for entry in (data or []):
         for name in entry.get("name_value", "").split("\n"):
             name = name.strip().lower().lstrip("*.")
             if name:
@@ -836,6 +910,135 @@ def _dnsx_brute(domain: str, words: list[str],
             continue
         out.add(host)
     return out, False
+
+
+# ---------------------------------------------------------------------------
+# Wildcard pool discovery and curated must-probe (bypass wildcard-skip)
+# ---------------------------------------------------------------------------
+# Problem: on targets like xinuty.com, `*.xinuty.com` is a wildcard A record
+# pointing to Vercel's edge IP pool. Every real Vercel-hosted subdomain
+# (zeenat, distributorpos) resolves to the SAME 4 IPs as every fake name
+# (wb-randomnonce). DNS alone cannot distinguish them. Our existing
+# `_dnsx_brute` correctly returns `wildcard_skip` here so we don't get
+# 100% false positives from the wordlist. But that also skips real hosts
+# like mail.xinuty.com which have a CNAME to webmail.rabhost.com plus a
+# totally different A record (45.8.227.100). The curated pass below catches
+# those "different infra" hosts cheaply (40 DNS lookups, ~2s) while still
+# leaving the wildcard-noise filtering to the HTTP content-diff stage.
+
+def _discover_wildcard_pool(domain: str,
+                            nonces: int = 8) -> tuple[set[str], set[str]]:
+    """Resolve `nonces` random nonsense names in parallel. Return
+    (ip_pool, cname_pool).
+
+    We collect both A records AND CNAME targets because some wildcards
+    are A-based (xinuty.com: *.domain -> 4 shared IPs) and some are
+    CNAME-based (e.g. *.hosted.io -> CNAME to proxy.hosted.io). The
+    curated must-probe below uses these sets as "if it matches this,
+    it's just wildcard noise" baselines.
+
+    Parallelised via ThreadPoolExecutor. Sequential dnspython on Windows
+    was hitting 50s+ wall per call because each UDP query with a 3-5s
+    lifetime adds up linearly across 16 lookups. With 8 workers the
+    whole pass finishes in <5s regardless of resolver speed.
+
+    Uses dnspython directly rather than dnsx so we always get the answer
+    even when the target has no dnsx binary installed."""
+    import random
+    import string
+    try:
+        import dns.resolver
+    except ImportError:
+        return set(), set()
+
+    def _one_nonce(_):
+        n = "".join(random.choices(
+            string.ascii_lowercase + string.digits, k=12))
+        full = f"{n}.{domain}"
+        ips, cnames = set(), set()
+        for rtype in ("CNAME", "A"):
+            try:
+                r = dns.resolver.Resolver()
+                r.timeout = 3
+                r.lifetime = 5
+                for rdata in r.resolve(full, rtype):
+                    if rtype == "CNAME":
+                        cnames.add(
+                            rdata.target.to_text().rstrip(".").lower())
+                    else:
+                        ips.add(rdata.address)
+            except Exception:
+                continue
+        return ips, cnames
+
+    ip_pool: set[str] = set()
+    cname_pool: set[str] = set()
+    with ThreadPoolExecutor(max_workers=min(nonces, 8)) as pool:
+        for ips, cnames in pool.map(_one_nonce, range(nonces)):
+            ip_pool.update(ips)
+            cname_pool.update(cnames)
+    return ip_pool, cname_pool
+
+
+def _curated_must_probe(domain: str, wild_ips: set[str],
+                        wild_cnames: set[str]) -> set[str]:
+    """Resolve CURATED_MUST_PROBE labels in parallel; return hosts that
+    look real.
+
+    A candidate is "real" (not wildcard noise) if EITHER:
+      (a) it has a CNAME whose target is NOT in the wildcard CNAME pool
+          -> e.g. mail.xinuty.com CNAMEs to webmail.rabhost.com while the
+             wildcard has no CNAME at all.
+      (b) its A record set contains at least one IP NOT in the wildcard
+          IP pool -> different infrastructure than the catch-all.
+
+    If the domain has no wildcard (empty wild_ips and wild_cnames),
+    ANY resolution is treated as real because there is no catchall to
+    filter against.
+
+    Parallelised with 20 workers. Sequential dnspython on Windows was
+    hitting 240s+ wall on 40 labels (each query 3-6s); parallel it runs
+    in ~5-10s.
+    """
+    try:
+        import dns.resolver
+    except ImportError:
+        return set()
+
+    no_wildcard = not wild_ips and not wild_cnames
+
+    def _one_label(label):
+        host = f"{label}.{domain}"
+        cnames, ips = set(), set()
+        for rtype in ("CNAME", "A"):
+            try:
+                r = dns.resolver.Resolver()
+                r.timeout = 2
+                r.lifetime = 4
+                for rdata in r.resolve(host, rtype):
+                    if rtype == "CNAME":
+                        cnames.add(
+                            rdata.target.to_text().rstrip(".").lower())
+                    else:
+                        ips.add(rdata.address)
+            except Exception:
+                continue
+        if not cnames and not ips:
+            return None
+        # Test 1: CNAME indicates separate infra
+        if cnames and (no_wildcard or not cnames.issubset(wild_cnames)):
+            return host
+        # Test 2: A records outside the wildcard pool
+        if ips and (no_wildcard or not ips.issubset(wild_ips)):
+            return host
+        return None
+
+    real: set[str] = set()
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        for h in pool.map(_one_label, CURATED_MUST_PROBE):
+            if h:
+                real.add(h)
+    return real
 
 
 def _permutations(known_subs: set[str], domain: str,
