@@ -33,7 +33,7 @@ BROWSER_UA = (
 
 def check_alive(subdomains: list[str]) -> dict:
     if not subdomains:
-        return {"alive": [], "dead": []}
+        return {"alive": [], "dead": [], "stale": []}
 
     result = None
     httpx = find_tool("httpx")
@@ -60,7 +60,53 @@ def check_alive(subdomains: list[str]) -> dict:
         result = _python_probe(subdomains)
 
     # Post-process: detect wildcard DNS regardless of engine used
-    return _dedup_wildcard(result)
+    result = _dedup_wildcard(result)
+    # Post-process: split "server responded with 4xx + tiny body" into
+    # a `stale` bucket so downstream stages don't waste probes on removed
+    # deployments.
+    return _split_stale(result)
+
+
+def _split_stale(result: dict) -> dict:
+    """Separate stale deployments from real alive hosts.
+
+    A sub that returns 4xx with a tiny body (Vercel `The Deployment does
+    not exist`, Netlify `Not Found`, Heroku `No such app`) has NO running
+    application. httpx still lists it as "alive" because HTTP responded,
+    but bug-bounty-wise there is nothing to inspect: no JS to harvest,
+    no sensitive paths to probe, no WAF to fingerprint (the 404 page IS
+    served by the CDN edge, but that tells us nothing about the app).
+
+    Move such entries into a `stale` bucket so:
+      - `alive_total` reflects genuinely usable hosts
+      - LLM report shows a clean primary list plus a "watchlist" bucket
+      - full_recon feeds only real alive URLs to waf/js/sensitive/nuclei
+
+    Rule: status >= 400 AND length < 500 bytes => stale. Bot-wall
+    challenge pages (Vercel Checkpoint, Cloudflare Turnstile) usually
+    carry 1500-8000 bytes of JS to run the challenge. Those stay in
+    `alive` because there IS a real app behind the wall; our later
+    js_harvest bot-wall filter handles the skip at that stage instead.
+    """
+    alive = result.get("alive", [])
+    real: list[dict] = []
+    stale: list[dict] = []
+    for a in alive:
+        st = a.get("status") or 0
+        ln = a.get("length")
+        # `length` may be None if the probe engine did not report it.
+        # Treat missing length as 0 (conservative -> flag as stale if 4xx).
+        if ln is None:
+            ln = 0
+        if st >= 400 and ln < 500:
+            stale.append(a)
+        else:
+            real.append(a)
+    result["alive"] = real
+    result["alive_total"] = len(real)
+    result["stale"] = stale
+    result["stale_total"] = len(stale)
+    return result
 
 
 def _parse_httpx(output: str, original: list[str]) -> dict:
