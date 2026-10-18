@@ -136,27 +136,46 @@ def resolve_subdomains(subdomains: str | list[str]) -> dict:
 
 @mcp.tool()
 def check_alive(subdomains: str | list[str]) -> dict:
-    """Probe subdomains over HTTP/HTTPS. Buckets results into three:
+    """Probe subdomains over HTTP/HTTPS. Buckets results into five:
 
-      alive  - real running app (2xx/3xx, or 4xx with substantial body
-               like a WAF challenge page indicating an app is behind it)
-      stale  - HTTP responded but 4xx with tiny body. Removed Netlify /
-               Vercel / Heroku deployments. Bug-bounty-wise nothing to
-               inspect here but useful as a watchlist.
-      dead   - no HTTP response at all (DNS fail, connection refused,
-               timeout).
+      alive         - real running app (2xx/3xx with unique content)
+      stale         - HTTP responded with 4xx + tiny body. Removed
+                      Netlify / Vercel / Heroku deployments. Nothing to
+                      inspect here but useful as a watchlist.
+      bot_walled    - HTTP responded with 4xx + large body whose title
+                      matches a known anti-bot challenge page (Vercel
+                      Security Checkpoint, Cloudflare Turnstile, Akamai).
+                      Underlying app is real but we can't see through
+                      the wall this run.
+      wildcard_http - HTTP responded with 4xx and the exact same
+                      (status, title) signature as a nonsense control
+                      hostname on the apex. Means Vercel / Netlify
+                      wildcard project is answering every random name
+                      with an identical 404 page. Not a real deployment.
+      dead          - no HTTP response at all (DNS fail, refused,
+                      timeout).
 
-    Returns: {'alive': [...], 'stale': [...], 'dead': [...],
-              'alive_total': int, 'stale_total': int, 'engine': str}
+    Returns: {'alive': [...], 'stale': [...], 'bot_walled': [...],
+              'wildcard_http': [...], 'dead': [...],
+              'alive_total': int, 'stale_total': int,
+              'bot_walled_total': int, 'wildcard_http_total': int,
+              'wildcard_http_signature': dict (only when matched),
+              'engine': str}
     """
     result = _alive(_to_list(subdomains))
     # Cap each list to avoid LLM context overflow on large targets.
     alive_list = result.get("alive", [])
     stale_list = result.get("stale", [])
+    wall_list = result.get("bot_walled", [])
+    wild_list = result.get("wildcard_http", [])
     result["alive_total"] = len(alive_list)
     result["stale_total"] = len(stale_list)
+    result["bot_walled_total"] = len(wall_list)
+    result["wildcard_http_total"] = len(wild_list)
     result["alive"] = alive_list[:30]
     result["stale"] = stale_list[:15]
+    result["bot_walled"] = wall_list[:15]
+    result["wildcard_http"] = wild_list[:15]
     return result
 
 
@@ -397,12 +416,17 @@ def full_recon(domain: str) -> dict:
         "subdomains_resolved": len(resolved.get("resolved", {})),
         "subdomains_alive": len(alive.get("alive", [])),
         "subdomains_stale": len(alive.get("stale", [])),
+        "subdomains_bot_walled": len(alive.get("bot_walled", [])),
+        "subdomains_wildcard_http": len(alive.get("wildcard_http", [])),
         "wildcard_catchall_filtered": alive.get("wildcard_catchall_count", 0),
         "confidence_summary": enum.get("confidence_summary", {}),
         "sources_used": enum.get("per_source", {}),
         "sources_failed": enum.get("sources_failed", []),
         "alive_details": alive.get("alive", [])[:30],
         "stale_details": alive.get("stale", [])[:15],
+        "bot_walled_details": alive.get("bot_walled", [])[:15],
+        "wildcard_http_details": alive.get("wildcard_http", [])[:15],
+        "wildcard_http_signature": alive.get("wildcard_http_signature"),
         "waf_summary": waf.get("summary", {}),
         "waf_detection_method": {
             "via_headers": waf_via_headers,

@@ -22,12 +22,14 @@ modern anti-bot walls.
 """
 
 import subprocess
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from config import find_tool
 from tools._http import (
     BROWSER_UA,
     IMPERSONATE_AVAILABLE as _HAS_CURL_CFFI,
+    strict_get,
     strict_get as _strict_get,
 )
 
@@ -72,7 +74,23 @@ def check_alive(subdomains: list[str]) -> dict:
     # Post-process: split "server responded with 4xx + tiny body" into
     # a `stale` bucket so downstream stages don't waste probes on removed
     # deployments.
-    return _split_stale(result)
+    result = _split_stale(result)
+    # Post-process: split 4xx responses whose title matches a known
+    # bot-wall challenge page (Vercel Security Checkpoint, Cloudflare
+    # Turnstile, Akamai Bot Manager) into `bot_walled`. Their bodies
+    # are large enough (~15-40 KB of JS challenge code) to escape the
+    # stale filter but they carry zero intel about the underlying app,
+    # so downstream js_harvest / sensitive_files / waf_fingerprint
+    # should skip them.
+    result = _split_bot_walled(result)
+    # Post-process: probe a nonsense hostname on the inferred apex and
+    # move any alive host whose (status, title) exactly matches that
+    # control response into `wildcard_http`. Catches Vercel wildcard
+    # projects and generic Next.js starter 404 handlers that answer
+    # every random name with an identical page. Without this filter,
+    # admin.xinuty.com and test12345.xinuty.com both look like "real
+    # deployments returning 404" because they share the same handler.
+    return _split_wildcard_http(result, subdomains)
 
 
 def _split_stale(result: dict) -> dict:
@@ -114,6 +132,141 @@ def _split_stale(result: dict) -> dict:
     result["alive_total"] = len(real)
     result["stale"] = stale
     result["stale_total"] = len(stale)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Bot-wall title signatures (Fix A)
+# ---------------------------------------------------------------------------
+# Modern anti-bot CDNs serve a distinctive HTML challenge page when they
+# decide a request is from a scanner. The pages all carry a title that
+# is stable across requests and across hostnames, but their body length
+# is 15-40 KB (well above our stale threshold of 500 bytes), so _split_stale
+# alone doesn't catch them. This list captures the visible fingerprints.
+WALL_TITLE_SIGNATURES = (
+    "vercel security checkpoint",   # Vercel's anti-bot challenge
+    "just a moment",                # Cloudflare classic interstitial
+    "checking your browser",        # Cloudflare newer interstitial
+    "attention required",           # Akamai Bot Manager
+    "security checkpoint",          # Generic variant
+    "verify you are human",         # Various
+    "pardon our interruption",      # Fastly / Section.io
+)
+
+
+def _looks_like_wall(title: str) -> bool:
+    """Case-insensitive substring match against known bot-wall titles."""
+    t = (title or "").lower()
+    return any(sig in t for sig in WALL_TITLE_SIGNATURES)
+
+
+def _split_bot_walled(result: dict) -> dict:
+    """Move 4xx responses whose title matches a known bot-wall signature
+    into `bot_walled`. Their bodies are large (JS challenge page) so
+    _split_stale misses them. Downstream stages (js_harvest, sensitive_files,
+    waf_fingerprint) currently waste probes on the challenge HTML and get
+    zero useful data. Splitting here saves that budget and makes the
+    `alive_total` count honest about how many hosts we can actually see
+    through to.
+    """
+    alive = result.get("alive", [])
+    wall: list[dict] = []
+    keep: list[dict] = []
+    for a in alive:
+        st = a.get("status") or 0
+        if st >= 400 and _looks_like_wall(a.get("title", "")):
+            wall.append(a)
+        else:
+            keep.append(a)
+    result["alive"] = keep
+    result["alive_total"] = len(keep)
+    result["bot_walled"] = wall
+    result["bot_walled_total"] = len(wall)
+    return result
+
+
+def _infer_apex(subdomains: list[str]) -> str | None:
+    """Take the last 2 labels of the first non-empty subdomain as apex.
+
+    Handles inputs like 'www.xinuty.com', 'https://xinuty.com', and
+    'mail.xinuty.com' - all infer 'xinuty.com'. Returns None on empty
+    or single-label input."""
+    for s in subdomains:
+        host = s.replace("http://", "").replace("https://", "")
+        host = host.split("/", 1)[0].strip().lower()
+        labels = [l for l in host.split(".") if l]
+        if len(labels) >= 2:
+            return ".".join(labels[-2:])
+    return None
+
+
+def _http_wildcard_probe_sig(apex: str, timeout: int = 5) -> tuple | None:
+    """Fetch a nonsense host on the apex and return (status, title_lower60)
+    if it responds, else None. Uses strict_get so curl_cffi Chrome
+    fingerprint is used (matching the real probes' transport).
+
+    A wildcard-DNS and wildcard-project target (e.g. xinuty.com on Vercel
+    with a catch-all Next.js app) answers ANY random name with an
+    identical page. Comparing real subs against this control response
+    separates 'genuinely deployed' from 'just the wildcard handler'."""
+    import random
+    import string
+    nonce = "".join(
+        random.choices(string.ascii_lowercase + string.digits, k=16))
+    probe = f"https://offsec-wildcard-{nonce}.{apex}"
+    try:
+        r = strict_get(probe, timeout=timeout)
+    except Exception:
+        return None
+    m = re.search(
+        r"<title[^>]*>(.*?)</title>",
+        r.text[:20000], re.I | re.S)
+    title = (m.group(1).strip().lower()[:60]) if m else ""
+    return (r.status_code, title)
+
+
+def _split_wildcard_http(result: dict, subdomains: list[str]) -> dict:
+    """Move any alive host whose (status, title) exactly matches the
+    control-probe response into `wildcard_http`. Only runs when at least
+    one 4xx entry remains in the alive bucket (2xx responses are almost
+    never wildcard noise). If the control probe itself fails or gets
+    bot-walled (matching one of our wall signatures) we skip this pass
+    to avoid false-flagging real subs."""
+    alive = result.get("alive", [])
+    four_x = [a for a in alive if (a.get("status") or 0) >= 400]
+    if not four_x:
+        result["wildcard_http"] = []
+        result["wildcard_http_total"] = 0
+        return result
+
+    apex = _infer_apex(subdomains)
+    if not apex:
+        result["wildcard_http"] = []
+        result["wildcard_http_total"] = 0
+        return result
+
+    sig = _http_wildcard_probe_sig(apex)
+    if sig is None or _looks_like_wall(sig[1]):
+        # Control probe failed or was bot-walled. Can't do a clean match
+        # this run; leave everything in alive.
+        result["wildcard_http"] = []
+        result["wildcard_http_total"] = 0
+        return result
+
+    wildcard_hits: list[dict] = []
+    keep: list[dict] = []
+    for a in alive:
+        a_sig = (a.get("status"), (a.get("title") or "").strip().lower()[:60])
+        if (a.get("status") or 0) >= 400 and a_sig == sig:
+            wildcard_hits.append(a)
+        else:
+            keep.append(a)
+    result["alive"] = keep
+    result["alive_total"] = len(keep)
+    result["wildcard_http"] = wildcard_hits
+    result["wildcard_http_total"] = len(wildcard_hits)
+    result["wildcard_http_signature"] = {
+        "status": sig[0], "title": sig[1]}
     return result
 
 
