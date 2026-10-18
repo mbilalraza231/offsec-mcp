@@ -108,7 +108,7 @@ SEVERITY_MAP = {
 
 
 def check_sensitive_files(urls: list[str], max_urls: int = 25,
-                          timeout: int = 8, max_workers: int = 20) -> dict:
+                          timeout: int = 8, max_workers: int = 12) -> dict:
     """Probe every SENSITIVE_PATH on every URL; report hits with severity.
 
     Args:

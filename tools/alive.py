@@ -1,63 +1,71 @@
 """
-tools/alive.py — HTTP liveness probe.
+tools/alive.py - HTTP liveness probe.
 
-Primary: httpx (ProjectDiscovery)
-Fallback: Python requests (HEAD + GET, thread-pooled)
+Engine order (Tier 1 fingerprint upgrade):
+  1. Primary: Python ThreadPool fan-out via tools/_http.strict_get, which
+     uses curl_cffi.requests.Session(impersonate="chrome120") to emit a
+     real Chrome 120 TLS handshake and HTTP/2 SETTINGS. Modern anti-bot
+     CDNs (Vercel Security Checkpoint, Cloudflare Turnstile, Akamai Bot
+     Manager) that return 403 walls to Go httpx and plain requests treat
+     this as legitimate browser traffic.
+  2. Fallback: httpx (ProjectDiscovery) Go binary, used only if the
+     Python path returns an empty result set (rare: happens when every
+     host timed out or was momentarily unreachable).
+  3. Last resort: plain `requests` inside strict_get's fallback branch,
+     used automatically when curl_cffi is not importable.
+
+The Go binary is deliberately second: it is fast but its TLS fingerprint
+is unique to Go's crypto/tls, which Vercel and Cloudflare now detect as
+scanner traffic. The Python+curl_cffi combo is only marginally slower
+across typical recon target sizes (< 200 hosts) but reliably passes
+modern anti-bot walls.
 """
 
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
-import urllib3
-
 from config import find_tool
-
-# We intentionally retry with verification disabled ONLY after a TLS error,
-# because recon targets routinely have self-signed / expired certs. Every
-# unverified hit is tagged `tls_verified: false` in the output so downstream
-# consumers (the LLM, the saved JSON report) can see exactly which probes
-# skipped cert validation. Normal browsing/production traffic is never sent
-# through this code path.
-TIMEOUT = 15
-
-# Real browser User-Agent: CDN/WAF bot-walls (Vercel, Cloudflare) serve an
-# identical 403 challenge to non-browser UAs, which hides real hosts. A
-# browser UA elicits the true response so alive/dead and wildcard noise can
-# be told apart.
-BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+from tools._http import (
+    BROWSER_UA,
+    IMPERSONATE_AVAILABLE as _HAS_CURL_CFFI,
+    strict_get as _strict_get,
 )
+
+# Overall stage budget. Python path uses 6s per-request timeout; httpx
+# binary uses 8s internally. Both fit comfortably inside TIMEOUT * 4.
+TIMEOUT = 15
 
 
 def check_alive(subdomains: list[str]) -> dict:
     if not subdomains:
         return {"alive": [], "dead": [], "stale": []}
 
-    result = None
-    httpx = find_tool("httpx")
-    if httpx:
-        try:
-            payload = "\n".join(subdomains).encode()
-            out = subprocess.check_output(
-                [httpx, "-silent", "-json", "-status-code",
-                 "-title", "-follow-redirects", "-no-color",
-                 "-timeout", "8", "-retries", "2", "-threads", "30",
-                 "-H", f"User-Agent: {BROWSER_UA}"],
-                input=payload, stderr=subprocess.DEVNULL, timeout=TIMEOUT * 4,
-            ).decode(errors="ignore")
-            result = _parse_httpx(out, subdomains)
-            # httpx can exit cleanly with ZERO lines when every host was slow
-            # or momentarily unreachable. Don't trust an empty result -> fall
-            # through to the Python probe, which retries over both schemes.
-            if not out.strip():
-                result = None
-        except Exception:
-            result = None
+    # --- Primary: Python + curl_cffi Chrome fingerprint -----------------
+    # Best fingerprint match against modern anti-bot CDNs. Runs first so
+    # Vercel / Cloudflare walls get through reliably.
+    result = _python_probe(subdomains)
 
-    if result is None:
-        result = _python_probe(subdomains)
+    # If the Python path returned nothing usable (all hosts DNS-failed or
+    # timed out at the socket layer), fall back to the Go httpx binary
+    # which has slightly different timeout behaviour and can salvage some
+    # hosts on flaky networks.
+    if not result.get("alive"):
+        httpx = find_tool("httpx")
+        if httpx:
+            try:
+                payload = "\n".join(subdomains).encode()
+                out = subprocess.check_output(
+                    [httpx, "-silent", "-json", "-status-code",
+                     "-title", "-follow-redirects", "-no-color",
+                     "-timeout", "8", "-retries", "2", "-threads", "15",
+                     "-H", f"User-Agent: {BROWSER_UA}"],
+                    input=payload, stderr=subprocess.DEVNULL,
+                    timeout=TIMEOUT * 4,
+                ).decode(errors="ignore")
+                if out.strip():
+                    result = _parse_httpx(out, subdomains)
+            except Exception:
+                pass
 
     # Post-process: detect wildcard DNS regardless of engine used
     result = _dedup_wildcard(result)
@@ -160,34 +168,40 @@ def _dedup_wildcard(result: dict) -> dict:
 
 
 def _python_probe(subdomains: list[str]) -> dict:
+    """Concurrent HTTP probe using Chrome-fingerprinted strict_get.
+
+    strict_get uses curl_cffi.requests.Session(impersonate="chrome120")
+    under the hood when the library is installed, which reliably gets
+    past Vercel Security Checkpoint and Cloudflare Turnstile that block
+    plain requests and Go httpx. Falls back to requests when curl_cffi
+    not available or when the specific URL rejects impersonated TLS.
+    """
     alive, dead = [], []
 
     def probe(sub: str):
-        headers = {"User-Agent": BROWSER_UA}
         for scheme in ("https", "http"):
             url = f"{scheme}://{sub}"
-            # First attempt: strict TLS verification (safe default).
             try:
-                r = requests.get(url, timeout=6, verify=True,
-                                 allow_redirects=True, headers=headers)
-                return {"url": url, "status": r.status_code,
-                        "title": _extract_title(r.text), "tls_verified": True}
-            except requests.exceptions.SSLError:
-                # Cert problem only — retry once without verification and mark it.
-                try:
-                    with urllib3.disable_warnings():
-                        r = requests.get(url, timeout=6, verify=False,
-                                         allow_redirects=True, headers=headers)
-                    return {"url": url, "status": r.status_code,
-                            "title": _extract_title(r.text), "tls_verified": False}
-                except Exception:
-                    continue
+                r = _strict_get(url, timeout=6, allow_redirects=True)
             except Exception:
-                # Connection refused / DNS fail / timeout — try next scheme.
+                # Any non-SSL failure (DNS, refused, timeout) -> try next
+                # scheme. SSLError-only relaxed retry already handled
+                # inside strict_get itself.
                 continue
+            return {
+                "url": url,
+                "status": r.status_code,
+                "title": _extract_title(r.text),
+                "length": len(r.content),
+                "tls_verified": getattr(r, "_tls_verified", True),
+            }
         return None
 
-    with ThreadPoolExecutor(max_workers=15) as pool:
+    # 10 threads instead of the previous 15: a real Chrome session opens
+    # 6-10 concurrent connections to a CDN, so 15 parallel Chrome-
+    # fingerprinted requests from one IP can itself look bot-like on
+    # strict detectors. 10 keeps throughput high without standing out.
+    with ThreadPoolExecutor(max_workers=10) as pool:
         futures = {pool.submit(probe, s): s for s in subdomains}
         for fut in as_completed(futures):
             sub = futures[fut]
@@ -197,7 +211,8 @@ def _python_probe(subdomains: list[str]) -> dict:
             else:
                 dead.append(sub)
 
-    return {"alive": alive, "dead": dead, "engine": "python-requests"}
+    engine = "python-curl_cffi" if _HAS_CURL_CFFI else "python-requests"
+    return {"alive": alive, "dead": dead, "engine": engine}
 
 
 def _extract_title(html: str) -> str:

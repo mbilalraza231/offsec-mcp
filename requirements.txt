@@ -5,5 +5,13 @@ mcp[cli]>=2,<3
 requests>=2.31.0
 dnspython>=2.4.0
 
+# Browser TLS fingerprint. Emits Chrome 120 ClientHello and HTTP/2 SETTINGS
+# byte-identical to real Chrome, which lets recon stages get past modern
+# anti-bot CDNs (Vercel Security Checkpoint, Cloudflare Turnstile, Akamai
+# Bot Manager) that return 403 challenge pages to plain requests or the
+# Go httpx binary. tools/_http.py gracefully degrades to `requests` if
+# this package is missing so it's optional at runtime.
+curl-cffi>=0.7.0
+
 # Optional: nicer tracebacks during development
 rich>=13.7.0

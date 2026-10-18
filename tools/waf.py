@@ -229,7 +229,11 @@ def fingerprint(subdomains: list[str], max_subs: int = 150,
             "stack_headers": stack,
         }
 
-    with ThreadPoolExecutor(max_workers=15) as pool:
+    # 10 threads: fingerprint is Chrome-fingerprinted via strict_get
+    # (curl_cffi impersonate="chrome120"). Real Chrome opens 6-10
+    # concurrent connections to a CDN; anything more than that can
+    # itself look bot-like even with a valid Chrome TLS handshake.
+    with ThreadPoolExecutor(max_workers=10) as pool:
         for res in pool.map(_fp, subs):
             if res:
                 results.append(res)
