@@ -409,6 +409,11 @@ def full_recon(domain: str) -> dict:
             "total_checks": sensitive.get("total_checks", 0),
             "counts_by_severity": sensitive.get("counts_by_severity", {}),
             "top_findings": sensitive.get("findings", [])[:30],
+            # Number of 200-status hits discarded as SPA fallback (soft-404)
+            # via the per-base-URL random-nonce baseline. Without this field
+            # a "0 findings" report is ambiguous: user can't tell if the
+            # target is genuinely clean or if the filter ate every hit.
+            "soft404_filtered": sensitive.get("soft404_filtered", 0),
         },
         "wayback_summary": {
             "total_archived_urls": archive.get("total_archived_urls", 0),
