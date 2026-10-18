@@ -185,18 +185,77 @@ def _split_bot_walled(result: dict) -> dict:
     return result
 
 
+# Second-level suffixes that behave as "the TLD" for apex extraction.
+# A naive "last 2 labels" rule would extract `co.uk` from
+# `test.example.co.uk`, which is nonsense to probe. This set is the
+# practical subset of the Public Suffix List you actually encounter on
+# bug-bounty programs; full PSL is ~10k lines and overkill for our
+# control-probe path.
+MULTI_SUFFIX_TLDS = frozenset({
+    # UK
+    "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk",
+    # Australia / New Zealand
+    "com.au", "net.au", "org.au", "edu.au", "gov.au", "id.au",
+    "co.nz", "net.nz", "org.nz", "govt.nz",
+    # East Asia
+    "co.jp", "ne.jp", "or.jp", "ac.jp", "go.jp", "gr.jp", "lg.jp",
+    "co.kr", "or.kr", "ne.kr", "go.kr", "re.kr", "pe.kr",
+    "com.cn", "net.cn", "org.cn", "edu.cn", "gov.cn",
+    # South / Southeast Asia
+    "co.in", "net.in", "org.in", "firm.in", "gen.in", "ind.in",
+    "com.pk", "net.pk", "org.pk", "edu.pk", "gov.pk", "gok.pk", "gob.pk", "cto.pk",
+    "com.bd", "net.bd", "org.bd", "gov.bd", "edu.bd", "ac.bd",
+    "com.np", "net.np", "org.np", "gov.np", "edu.np", "ac.np",
+    "com.lk", "net.lk", "org.lk", "gov.lk", "edu.lk", "ac.lk", "ltd.lk",
+    "com.sg", "edu.sg", "gov.sg", "net.sg", "org.sg",
+    "com.my", "net.my", "org.my", "edu.my", "gov.my",
+    "com.ph", "net.ph", "org.ph", "gov.ph", "edu.ph",
+    "com.vn", "net.vn", "org.vn", "gov.vn", "edu.vn",
+    "co.id", "com.id", "net.id", "org.id", "go.id", "ac.id",
+    "co.th", "or.th", "go.th", "in.th", "ac.th",
+    # Americas
+    "com.br", "net.br", "org.br", "gov.br", "edu.br",
+    "com.mx", "org.mx", "gob.mx", "edu.mx",
+    "com.ar", "net.ar", "gob.ar", "edu.ar",
+    "com.co", "net.co", "org.co", "gov.co", "edu.co",
+    "com.pe", "gob.pe", "net.pe",
+    # Europe / Middle East / Africa
+    "com.ua", "kiev.ua", "lviv.ua",
+    "com.tr", "org.tr", "net.tr", "gov.tr", "edu.tr", "k12.tr",
+    "co.za", "org.za", "net.za", "gov.za", "edu.za",
+    "co.ke", "or.ke", "ne.ke", "go.ke", "ac.ke",
+    "com.ng", "net.ng", "org.ng", "gov.ng", "edu.ng", "name.ng",
+    "com.gh", "net.gh", "org.gh",
+    "co.tz", "or.tz", "go.tz", "ac.tz", "ne.tz",
+    "co.ug", "or.ug", "go.ug", "ac.ug", "ne.ug", "sc.ug",
+    "co.zw", "or.zw", "ac.zw", "go.zw",
+    "com.eg", "org.eg", "net.eg",
+    "co.il", "org.il", "net.il", "gov.il", "muni.il",
+})
+
+
 def _infer_apex(subdomains: list[str]) -> str | None:
-    """Take the last 2 labels of the first non-empty subdomain as apex.
+    """Return the registrable apex (a.k.a. eTLD+1) of the first valid
+    hostname in the list.
 
     Handles inputs like 'www.xinuty.com', 'https://xinuty.com', and
-    'mail.xinuty.com' - all infer 'xinuty.com'. Returns None on empty
-    or single-label input."""
+    'mail.xinuty.com' - all infer 'xinuty.com'. Recognises common
+    two-part suffixes (co.uk, com.au, com.pk, etc.) so that a target
+    like shop.example.co.uk correctly returns 'example.co.uk', not
+    the nonsense string 'co.uk'. Returns None on empty or single-label
+    input."""
     for s in subdomains:
         host = s.replace("http://", "").replace("https://", "")
         host = host.split("/", 1)[0].strip().lower()
+        # Strip port if present
+        host = host.split(":", 1)[0]
         labels = [l for l in host.split(".") if l]
-        if len(labels) >= 2:
-            return ".".join(labels[-2:])
+        if len(labels) == 1:
+            continue
+        last_two = ".".join(labels[-2:])
+        if len(labels) >= 3 and last_two in MULTI_SUFFIX_TLDS:
+            return ".".join(labels[-3:])
+        return last_two
     return None
 
 

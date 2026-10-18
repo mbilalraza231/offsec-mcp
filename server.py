@@ -344,6 +344,18 @@ def full_recon(domain: str) -> dict:
     resolved = _safe(lambda: _resolve(subs), "resolve", {"resolved": {}})
     alive = _safe(lambda: _alive(subs), "alive", {"alive": []})
     alive_urls = [a["url"] for a in alive.get("alive", [])]
+    # URL list specifically for WAF fingerprinting. Every non-dead bucket
+    # carries useful edge headers (server:, x-vercel-id, cf-ray,
+    # x-nf-app-id, x-akamai-request-id, etc.), so we include stale +
+    # bot_walled + wildcard_http even though those URLs are excluded from
+    # the intel-carrying stages (js_harvest, sensitive_files, nuclei).
+    waf_input_urls = alive_urls + [
+        a["url"] for a in alive.get("stale", [])
+        if a.get("url")] + [
+        a["url"] for a in alive.get("bot_walled", [])
+        if a.get("url")] + [
+        a["url"] for a in alive.get("wildcard_http", [])
+        if a.get("url")]
 
     # Stages 4-9 (waf, js, sensitive, wayback, takeover, nuclei) are all
     # independent - they only need `subs` or `alive_urls` as input. Run
@@ -358,7 +370,7 @@ def full_recon(domain: str) -> dict:
     tk_default = {"vulnerable": []}
     nuc_default = {"findings": [], "count": 0}
 
-    def _t_waf(): return _safe(lambda: _waf_fp(alive_urls or subs),
+    def _t_waf(): return _safe(lambda: _waf_fp(waf_input_urls or subs),
                                "waf_fingerprint", waf_default)
 
     def _t_js(): return _safe(
