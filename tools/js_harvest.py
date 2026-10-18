@@ -3,7 +3,7 @@ tools/js_harvest.py - deep-fetch HTML + JavaScript on alive subdomains and
 regex-extract EVERY host, endpoint and possible secret referenced in the code.
 
 Why this tool exists: top bug bounty hunters do this manually every day. Real
-subdomains like `api.internal.xinuty.com` and staging URLs are NEVER in
+subdomains like `api.internal.example.com` and staging URLs are NEVER in
 cert-transparency logs or search-engine indexes; they only exist INSIDE the
 production app's JS bundle. Same for leaked API keys, JWTs, AWS credentials,
 and hidden endpoints like `/internal/v1/refund`.
@@ -266,7 +266,7 @@ def harvest_javascript(urls: list[str], domain: str | None = None,
 
     # If caller scoped the scan to a specific target domain, keep only
     # hosts on that domain (apex or subdomain). This is the single biggest
-    # signal-to-noise win: bug bounty users care about `*.xinuty.com`,
+    # signal-to-noise win: bug bounty users care about `*.example.com`,
     # not about random method-call patterns that look like `a.id`.
     if domain:
         d = domain.lower().lstrip(".")

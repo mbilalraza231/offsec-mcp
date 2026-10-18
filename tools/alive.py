@@ -88,7 +88,7 @@ def check_alive(subdomains: list[str]) -> dict:
     # control response into `wildcard_http`. Catches Vercel wildcard
     # projects and generic Next.js starter 404 handlers that answer
     # every random name with an identical page. Without this filter,
-    # admin.xinuty.com and test12345.xinuty.com both look like "real
+    # admin.example.com and test12345.example.com both look like "real
     # deployments returning 404" because they share the same handler.
     result = _split_wildcard_http(result, subdomains)
     # Strip private helper fields (_body_head) before returning so they
@@ -282,8 +282,8 @@ def _infer_apex(subdomains: list[str]) -> str | None:
     """Return the registrable apex (a.k.a. eTLD+1) of the first valid
     hostname in the list.
 
-    Handles inputs like 'www.xinuty.com', 'https://xinuty.com', and
-    'mail.xinuty.com' - all infer 'xinuty.com'. Recognises common
+    Handles inputs like 'www.example.com', 'https://example.com', and
+    'mail.example.com' - all infer 'example.com'. Recognises common
     two-part suffixes (co.uk, com.au, com.pk, etc.) so that a target
     like shop.example.co.uk correctly returns 'example.co.uk', not
     the nonsense string 'co.uk'. Returns None on empty or single-label
@@ -308,7 +308,7 @@ def _http_wildcard_probe_sig(apex: str, timeout: int = 5) -> tuple | None:
     if it responds, else None. Uses strict_get so curl_cffi Chrome
     fingerprint is used (matching the real probes' transport).
 
-    A wildcard-DNS and wildcard-project target (e.g. xinuty.com on Vercel
+    A wildcard-DNS and wildcard-project target (e.g. example.com on Vercel
     with a catch-all Next.js app) answers ANY random name with an
     identical page. Comparing real subs against this control response
     separates 'genuinely deployed' from 'just the wildcard handler'."""

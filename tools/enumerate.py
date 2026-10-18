@@ -43,7 +43,7 @@ TIMEOUT = 25
 # stand up on their OWN infrastructure (different IP or CNAME than the
 # wildcard pool). Used as a last-resort probe when dnsx-brute is
 # wildcard-skipped, so we still catch mail / cpanel / admin etc. on
-# targets like xinuty.com where *.domain resolves to a Vercel edge pool
+# targets like example.com where *.domain resolves to a Vercel edge pool
 # but mail.domain has a CNAME to a totally separate webmail host.
 # Kept to 40 labels: pure-DNS probes, ~1-2s wall time, high hit-rate.
 CURATED_MUST_PROBE = (
@@ -411,7 +411,7 @@ def _wayback_crawl(domain: str, max_pages: int = 8,
                    seeds: list[str] | None = None) -> set[str]:
     """Wayback link-crawl: scrape archived HTML and extract subdomain refs.
 
-    This finds hosts like `restaurant.target.com` that were NEVER archived
+    This finds hosts like `shop.target.com` that were NEVER archived
     themselves but appear as links/assets inside an archived homepage. The
     CDX API (source #6) only returns archived *URLs*; this digs the
     references out of the archived *page bodies*.
@@ -541,7 +541,7 @@ def _duckduckgo(domain: str) -> set[str]:
     but that are missing from every cert-transparency / passive-DNS /
     Wayback source. Real bug bounty hunters use this exact query
     manually; automating it is a large coverage gain on wildcard-CDN
-    targets (custom brand names like `zeenat.xinuty.com` never appear
+    targets (custom brand names like `docs.example.com` never appear
     in any wordlist or cert, only in pages that linked to them).
 
     Uses the html.duckduckgo.com HTML endpoint (no API key, unlike
@@ -662,7 +662,7 @@ PASSIVE_SOURCES = [
 # Active brute force - single-pass httpx with wildcard content-diffing
 # httpx resolves + probes + returns content in ONE pass (much faster than
 # doing dnsx then httpx separately). Curated service wordlist guarantees
-# high-value names (restaurant, mail, api, ...) even when ranked past 9000
+# high-value names (shop, mail, api, ...) even when ranked past 9000
 # in the raw SecLists file.
 # ---------------------------------------------------------------------------
 
@@ -801,7 +801,7 @@ def _active_dns_verify(domain: str) -> set[str]:
     Vercel and Cloudflare no longer serve us 403 bot-challenge pages on
     this stage. Previously used the Go httpx binary which was fast but
     got wall-blocked intermittently, dropping real hosts like
-    restaurant.xinuty.com from the run-to-run result set.
+    shop.example.com from the run-to-run result set.
     """
     import random
     import string
@@ -932,7 +932,7 @@ def _dnsx_brute(domain: str, words: list[str],
       - none resolve  -> domain has NO wildcard DNS. Every resolved
         candidate from the wordlist is a REAL hit.
       - all resolve   -> wildcard DNS is on. DNS alone cannot tell a
-        real sub (e.g. restaurant.host) from a fake one (e.g. xyz.host)
+        real sub (e.g. shop.host) from a fake one (e.g. xyz.host)
         when both route through a CDN with a large shared IP pool. The
         only reliable signal is HTTP content-diff (which the downstream
         httpx stage handles). So we return an empty hit set and let the
@@ -974,13 +974,13 @@ def _dnsx_brute(domain: str, words: list[str],
 # ---------------------------------------------------------------------------
 # Wildcard pool discovery and curated must-probe (bypass wildcard-skip)
 # ---------------------------------------------------------------------------
-# Problem: on targets like xinuty.com, `*.xinuty.com` is a wildcard A record
+# Problem: on targets like example.com, `*.example.com` is a wildcard A record
 # pointing to Vercel's edge IP pool. Every real Vercel-hosted subdomain
-# (zeenat, distributorpos) resolves to the SAME 4 IPs as every fake name
+# (docs, distributorpos) resolves to the SAME 4 IPs as every fake name
 # (wb-randomnonce). DNS alone cannot distinguish them. Our existing
 # `_dnsx_brute` correctly returns `wildcard_skip` here so we don't get
 # 100% false positives from the wordlist. But that also skips real hosts
-# like mail.xinuty.com which have a CNAME to webmail.rabhost.com plus a
+# like mail.example.com which have a CNAME to mail.mailprovider.example plus a
 # totally different A record (45.8.227.100). The curated pass below catches
 # those "different infra" hosts cheaply (40 DNS lookups, ~2s) while still
 # leaving the wildcard-noise filtering to the HTTP content-diff stage.
@@ -991,7 +991,7 @@ def _discover_wildcard_pool(domain: str,
     (ip_pool, cname_pool).
 
     We collect both A records AND CNAME targets because some wildcards
-    are A-based (xinuty.com: *.domain -> 4 shared IPs) and some are
+    are A-based (example.com: *.domain -> 4 shared IPs) and some are
     CNAME-based (e.g. *.hosted.io -> CNAME to proxy.hosted.io). The
     curated must-probe below uses these sets as "if it matches this,
     it's just wildcard noise" baselines.
@@ -1046,7 +1046,7 @@ def _curated_must_probe(domain: str, wild_ips: set[str],
 
     A candidate is "real" (not wildcard noise) if EITHER:
       (a) it has a CNAME whose target is NOT in the wildcard CNAME pool
-          -> e.g. mail.xinuty.com CNAMEs to webmail.rabhost.com while the
+          -> e.g. mail.example.com CNAMEs to mail.mailprovider.example while the
              wildcard has no CNAME at all.
       (b) its A record set contains at least one IP NOT in the wildcard
           IP pool -> different infrastructure than the catch-all.

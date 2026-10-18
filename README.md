@@ -72,8 +72,8 @@ ThreadPoolExecutor. Any single failure never blocks the pipeline.
 | 1 | subfinder (binary, `-all`) | 50+ APIs merged | Massive passive coverage |
 | 2 | crt.sh | Cert Transparency | All issued SSL certs |
 | 3 | CertSpotter | Cert Transparency | Independent CT mirror (redundancy when crt.sh 502s) |
-| 4 | **DuckDuckGo HTML dork** | **Search engine index** | **Brand-name hosts only visible in live links** (e.g. `zeenat.xinuty.com`) |
-| 5 | **Bing HTML dork** | **Search engine index** | **Different crawl slice — hosts DDG/Google miss** (e.g. `2a.xinuty.com`) |
+| 4 | **DuckDuckGo HTML dork** | **Search engine index** | **Brand-name hosts only visible in live links** (e.g. `docs.example.com`) |
+| 5 | **Bing HTML dork** | **Search engine index** | **Different crawl slice — hosts DDG/Google miss** (e.g. `2a.example.com`) |
 | 6 | HackerTarget | Passive DNS | Free hostsearch API |
 | 7 | AlienVault OTX | Passive DNS | Historical resolutions |
 | 8 | RapidDNS | Community DB | Scraped subdomains |
@@ -142,10 +142,10 @@ They talk over **SSE** — a live HTTP connection at `http://127.0.0.1:8000/sse`
 A single request, step by step:
 
 1. On connect, the server advertises 9 tools + descriptions.
-2. You type `enumerate subdomains for xinuty.com`.
+2. You type `enumerate subdomains for example.com`.
 3. The model does **not** guess. It emits a structured call:
    ```json
-   { "tool": "enumerate_subdomains", "arguments": { "domain": "xinuty.com" } }
+   { "tool": "enumerate_subdomains", "arguments": { "domain": "example.com" } }
    ```
 4. The server fires **8 passive sources in parallel** (ThreadPoolExecutor) plus
    a ~500-name httpx brute force — one shared deadline, no sequential waiting.
