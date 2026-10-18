@@ -139,9 +139,13 @@ def check_alive(subdomains: str | list[str]) -> dict:
     """Probe subdomains over HTTP/HTTPS. Buckets results into five:
 
       alive         - real running app (2xx/3xx with unique content)
-      stale         - HTTP responded with 4xx + tiny body. Removed
-                      Netlify / Vercel / Heroku deployments. Nothing to
-                      inspect here but useful as a watchlist.
+      stale         - HTTP responded with 4xx and either tiny body (under
+                      500 bytes) OR body matches a known PaaS 'no
+                      deployment attached' marker (Vercel
+                      DEPLOYMENT_NOT_FOUND, Netlify 'this site is not
+                      connected', Heroku 'no such application'). Semantically
+                      dead - the hostname resolves and HTTP answers, but
+                      no real app is running behind it.
       bot_walled    - HTTP responded with 4xx + large body whose title
                       matches a known anti-bot challenge page (Vercel
                       Security Checkpoint, Cloudflare Turnstile, Akamai).

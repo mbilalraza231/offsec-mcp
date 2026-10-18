@@ -90,7 +90,19 @@ def check_alive(subdomains: list[str]) -> dict:
     # every random name with an identical page. Without this filter,
     # admin.xinuty.com and test12345.xinuty.com both look like "real
     # deployments returning 404" because they share the same handler.
-    return _split_wildcard_http(result, subdomains)
+    result = _split_wildcard_http(result, subdomains)
+    # Strip private helper fields (_body_head) before returning so they
+    # do not leak into the MCP response and eat LLM tokens.
+    return _strip_private_fields(result)
+
+
+def _strip_private_fields(result: dict) -> dict:
+    """Drop keys starting with `_` from every entry in every bucket."""
+    for bucket in ("alive", "stale", "bot_walled", "wildcard_http"):
+        for entry in result.get(bucket, []):
+            for k in [k for k in entry if k.startswith("_")]:
+                entry.pop(k, None)
+    return result
 
 
 def _split_stale(result: dict) -> dict:
@@ -108,11 +120,11 @@ def _split_stale(result: dict) -> dict:
       - LLM report shows a clean primary list plus a "watchlist" bucket
       - full_recon feeds only real alive URLs to waf/js/sensitive/nuclei
 
-    Rule: status >= 400 AND length < 500 bytes => stale. Bot-wall
-    challenge pages (Vercel Checkpoint, Cloudflare Turnstile) usually
-    carry 1500-8000 bytes of JS to run the challenge. Those stay in
-    `alive` because there IS a real app behind the wall; our later
-    js_harvest bot-wall filter handles the skip at that stage instead.
+    Rule: status >= 400 AND (length under 500 bytes OR body_head matches
+    a known PaaS "no deployment" marker) => stale. Bot-wall challenge
+    pages (Vercel Checkpoint, Cloudflare Turnstile) usually carry 15-40 KB
+    of JS and do NOT match either rule. Those are handled separately by
+    _split_bot_walled.
     """
     alive = result.get("alive", [])
     real: list[dict] = []
@@ -124,7 +136,10 @@ def _split_stale(result: dict) -> dict:
         # Treat missing length as 0 (conservative -> flag as stale if 4xx).
         if ln is None:
             ln = 0
-        if st >= 400 and ln < 500:
+        body_head = a.get("_body_head") or ""
+        is_missing = bool(a.get("_deployment_missing")
+                          ) or _looks_like_deployment_missing(body_head)
+        if st >= 400 and (not (ln or 0) >= 500 or is_missing):
             stale.append(a)
         else:
             real.append(a)
@@ -158,6 +173,35 @@ def _looks_like_wall(title: str) -> bool:
     """Case-insensitive substring match against known bot-wall titles."""
     t = (title or "").lower()
     return any(sig in t for sig in WALL_TITLE_SIGNATURES)
+
+
+# PaaS edge "no app attached to this hostname" markers. When Vercel,
+# Netlify or Heroku receives a request for a hostname that resolves
+# (wildcard DNS) but has no deployment bound to it, the edge itself
+# returns a small HTML page saying so. Semantically identical to a
+# dead target: nothing to inspect, no JS, no WAF, no sensitive paths.
+# Only difference from `stale` is the body is 1-8 KB (too big for the
+# length under 500 rule, so we detect by matching distinctive substrings.
+DEPLOYMENT_MISSING_SIGNATURES = (
+    "deployment_not_found",              # Vercel edge default
+    "deployment does not exist",         # Vercel alt phrasing
+    "this deployment has been removed",  # Vercel paused / deleted
+    "app error: no such app",            # Heroku
+    "no such application",               # Heroku alt
+    "this site is not connected",        # Netlify
+    "page not found - netlify",          # Netlify title
+    "site not found",                    # Netlify alt
+    "the requested resource could not be found",  # Netlify / generic
+)
+
+
+def _looks_like_deployment_missing(body_head: str) -> bool:
+    """Match a lowercased body-start snippet against known PaaS
+    'no deployment attached' markers. Only inspects first ~2000 chars
+    because these strings appear near the top of the response."""
+    if not body_head:
+        return False
+    return any(sig in body_head for sig in DEPLOYMENT_MISSING_SIGNATURES)
 
 
 def _split_bot_walled(result: dict) -> dict:
@@ -406,6 +450,14 @@ def _python_probe(subdomains: list[str]) -> dict:
                 "title": _extract_title(r.text),
                 "length": len(r.content),
                 "tls_verified": getattr(r, "_tls_verified", True),
+                # Private flag: computed once at probe time by scanning
+                # the whole response body against PaaS "no deployment"
+                # markers. _split_stale uses it, then _strip_private_fields
+                # removes it before returning to LLM. Cheaper than
+                # keeping body_head in memory across ~30 entries and
+                # avoids any snippet-window truncation issue.
+                "_deployment_missing": _looks_like_deployment_missing(
+                    r.text.lower()),
             }
         return None
 
