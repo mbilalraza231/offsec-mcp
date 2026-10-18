@@ -30,6 +30,12 @@ from urllib.parse import quote
 import requests
 
 from config import find_tool
+from tools._http import strict_get
+
+# Used to build query-string URLs when passing through strict_get
+# (curl_cffi's Session accepts params too, but keeping URL construction
+# explicit at callsites makes the query visible in every log line).
+from urllib.parse import urlencode
 
 TIMEOUT = 25
 
@@ -542,13 +548,15 @@ def _duckduckgo(domain: str) -> set[str]:
     Google's Custom Search JSON). Skips redirect-wrapped result URLs
     whose hostnames look like `2Fxxx.domain.com` (those are percent-
     encoded slashes from DDG's `/l/?uddg=` link wrapper leaking into
-    our regex - the clean form also appears in the same results)."""
-    url = "https://html.duckduckgo.com/html/"
-    resp = requests.get(
-        url,
-        params={"q": f"site:{domain} OR site:*.{domain}"},
-        timeout=TIMEOUT, headers=HEADERS,
-    )
+    our regex - the clean form also appears in the same results).
+
+    Fetches via strict_get so we emit a real Chrome 120 TLS fingerprint.
+    DDG's rate limiter blocks plain Python requests and Go httpx pretty
+    aggressively; Chrome-fingerprinted clients get served the actual
+    HTML far more reliably."""
+    url = ("https://html.duckduckgo.com/html/?"
+           + urlencode({"q": f"site:{domain} OR site:*.{domain}"}))
+    resp = strict_get(url, timeout=TIMEOUT, headers=HEADERS)
     if resp.status_code == 403:
         raise RuntimeError("duckduckgo rate-limited (403)")
     resp.raise_for_status()
@@ -577,12 +585,13 @@ def _bing(domain: str) -> set[str]:
     pages that index faster on Bing. Free, no API key (public HTML
     endpoint, not the Azure Search API). Skips Bing's own URL-tracker
     artifacts (`r.bing.com`, `www.bing.com/ck/`) that leak into our
-    hostname regex."""
-    resp = requests.get(
-        "https://www.bing.com/search",
-        params={"q": f"site:{domain} OR site:*.{domain}"},
-        timeout=TIMEOUT, headers=HEADERS,
-    )
+    hostname regex.
+
+    Uses strict_get so Bing sees a real Chrome TLS handshake and is far
+    less likely to serve a 403 challenge page."""
+    url = ("https://www.bing.com/search?"
+           + urlencode({"q": f"site:{domain} OR site:*.{domain}"}))
+    resp = strict_get(url, timeout=TIMEOUT, headers=HEADERS)
     if resp.status_code in (403, 429):
         raise RuntimeError(f"bing rate-limited ({resp.status_code})")
     resp.raise_for_status()
@@ -733,21 +742,70 @@ def _httpx_probe(httpx: str, hosts: list[str], timeout: int) -> dict:
     return result
 
 
-def _active_dns_verify(domain: str) -> set[str]:
-    """Single-pass httpx brute force with wildcard content-diffing.
+def _python_probe_for_signature(hosts: list[str], timeout: int = 5,
+                                max_workers: int = 25) -> dict:
+    """Concurrent HTTP probe using strict_get (Chrome 120 TLS fingerprint).
 
-    A wildcard CDN serves the SAME catch-all page (same status + title) for
-    every name. A real subdomain serves a DISTINCT page. We probe baseline
-    (random names), then keep only hosts whose (status, title) differs from
-    the catch-all cluster.
+    Returns `{host: (status_code, normalized_title_lower_truncated_60)}`
+    for every host that gave any HTTP response. Hosts that failed DNS /
+    connection / timeout are absent from the dict.
+
+    Replaces the previous Go httpx subprocess call. Go's crypto/tls
+    fingerprint is a bot tell Vercel and Cloudflare now check for; a
+    Chrome-impersonated Python client passes those walls. strict_get's
+    own internal fallback (curl_cffi strict -> curl_cffi relaxed ->
+    requests strict -> requests relaxed) preserves functionality for
+    users without curl_cffi installed or for hosts that reject
+    impersonated TLS.
+
+    25 threads (not 150 as in the Go path): a real Chrome session opens
+    6-10 concurrent connections to a CDN, so 150 Chrome-fingerprinted
+    requests from one residential IP itself looks impossible. 25 is
+    still fast (~40s for 500 hosts) without triggering the
+    too-many-concurrent-sessions detector.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    probed: dict[str, tuple] = {}
+
+    def _one(host: str):
+        for scheme in ("https", "http"):
+            try:
+                r = strict_get(f"{scheme}://{host}", timeout=timeout)
+            except Exception:
+                continue
+            # Title from first 20 KB. Real pages have <title> in head
+            # near the top; avoids scanning 100 KB+ minified bundles.
+            m = re.search(
+                r"<title[^>]*>(.*?)</title>",
+                r.text[:20000], re.I | re.S)
+            title = (m.group(1).strip().lower()[:60]) if m else ""
+            return host, (r.status_code, title)
+        return host, None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for host, sig in pool.map(_one, hosts):
+            if sig is not None:
+                probed[host] = sig
+    return probed
+
+
+def _active_dns_verify(domain: str) -> set[str]:
+    """Single-pass Python HTTP brute force with wildcard content-diffing.
+
+    A wildcard CDN serves the SAME catch-all page (same status + title)
+    for every name. A real subdomain serves a DISTINCT page. We probe
+    baseline (random names) then keep only hosts whose (status, title)
+    differs from the catch-all cluster.
+
+    Chrome TLS fingerprint comes from strict_get's curl_cffi path, so
+    Vercel and Cloudflare no longer serve us 403 bot-challenge pages on
+    this stage. Previously used the Go httpx binary which was fast but
+    got wall-blocked intermittently, dropping real hosts like
+    restaurant.xinuty.com from the run-to-run result set.
     """
     import random
     import string
     from collections import Counter
-
-    httpx = find_tool("httpx")
-    if not httpx:
-        return set()
 
     words = _load_words()
     candidates = [f"{w}.{domain}" for w in words]
@@ -758,9 +816,10 @@ def _active_dns_verify(domain: str) -> set[str]:
         for _ in range(6)
     ]
 
-    # Run baseline + candidates in one httpx pass for speed
+    # One Python pass over baseline + candidates. 25 threads keeps wall
+    # time around 40-90s for a ~500-name wordlist.
     all_hosts = candidates + baseline_names
-    probed = _httpx_probe(httpx, all_hosts, timeout=200)
+    probed = _python_probe_for_signature(all_hosts, timeout=5, max_workers=25)
     if not probed:
         return set()
 
