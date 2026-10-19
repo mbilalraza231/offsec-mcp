@@ -1,8 +1,13 @@
 """
-tools/vuln.py — vulnerability scan with nuclei.
+tools/vuln.py - vulnerability scan with nuclei.
 
-No pure-Python fallback — nuclei's template engine is irreplaceable.
+No pure-Python fallback - nuclei's template engine is irreplaceable.
 If nuclei is missing, returns a clear message telling the user to install it.
+
+Templates live on the SSD next to the binary (`bin/nuclei-templates/`)
+so the whole setup stays portable. Bootstrap once:
+
+    nuclei -update-templates -ud <ssd>/offsec-mcp/bin/nuclei-templates
 """
 
 import json
@@ -11,9 +16,11 @@ import tempfile
 from collections import Counter
 from pathlib import Path
 
-from config import find_tool
+from config import BIN_DIR, find_tool
 
 TIMEOUT = 300  # 5 min cap
+
+LOCAL_TEMPLATES_DIR = BIN_DIR / "nuclei-templates"
 
 
 def scan_vulnerabilities(targets: list[str]) -> dict:
@@ -27,7 +34,7 @@ def scan_vulnerabilities(targets: list[str]) -> dict:
             "count": 0,
             "severity_breakdown": {},
             "message": (
-                "nuclei not installed — run installers/install-tools.ps1 "
+                "nuclei not installed - run installers/install-tools.ps1 "
                 "or download from https://github.com/projectdiscovery/nuclei/releases"
             ),
         }
@@ -36,10 +43,21 @@ def scan_vulnerabilities(targets: list[str]) -> dict:
         f.write("\n".join(targets))
         target_file = f.name
 
+    # Only pass -t when the SSD template dir actually exists and has
+    # content. Otherwise let nuclei hit its own default and we surface
+    # the exit=2 hint below.
+    tmpl_args: list[str] = []
+    if LOCAL_TEMPLATES_DIR.exists():
+        try:
+            if any(LOCAL_TEMPLATES_DIR.rglob("*.yaml")):
+                tmpl_args = ["-t", str(LOCAL_TEMPLATES_DIR)]
+        except OSError:
+            tmpl_args = []
+
     try:
         proc = subprocess.run(
             [nuclei, "-l", target_file, "-silent", "-json", "-no-color",
-             "-severity", "info,low,medium,high,critical"],
+             "-severity", "info,low,medium,high,critical"] + tmpl_args,
             capture_output=True, text=True, timeout=TIMEOUT,
         )
         findings = []
@@ -63,15 +81,20 @@ def scan_vulnerabilities(targets: list[str]) -> dict:
             "engine": "nuclei",
             "targets_scanned": len(targets),
         }
-        # Distinguish "nuclei ran & found nothing" (legit) from
-        # "nuclei errored / no templates" (misleading zero). If exit
-        # code != 0 and findings == 0, surface stderr preview so the
-        # user knows the scan didn't actually happen.
+        # Exit 2 with no findings = nuclei failed to initialise, almost
+        # always because templates are missing. Exit 0 with no findings
+        # = legit "clean scan". Distinguish them.
         if proc.returncode != 0 and not findings:
-            result["engine_error"] = (
-                f"nuclei exit={proc.returncode}; "
-                f"stderr preview: {(proc.stderr or '')[:250]}"
-            )
+            if proc.returncode == 2:
+                result["engine_error"] = (
+                    "nuclei exit=2 with no templates. Run once: "
+                    f"nuclei -update-templates -ud {LOCAL_TEMPLATES_DIR}"
+                )
+            else:
+                result["engine_error"] = (
+                    f"nuclei exit={proc.returncode}; "
+                    f"stderr preview: {(proc.stderr or '')[:250]}"
+                )
         return result
     except subprocess.TimeoutExpired:
         return {
