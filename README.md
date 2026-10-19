@@ -116,8 +116,28 @@ Plus **four active stages** that run after the passive sources:
 |-------|-----------|-----------------------------|
 | **dnsx DNS brute** | Full SecLists 110k wordlist over DNS with wildcard-IP filter | Non-web subdomains (git, smtp, jenkins, redis, internal) that don't serve HTTP |
 | **Altdns permutations** | Numbered + modifier-cross-product + hyphen↔dot variants of known labels | Real-world compound names not in any wordlist: `staging-api`, `api-v2`, `dev-mail` |
-| httpx content-diff brute | ~500 curated service names, resolve+probe in one pass, status+title dedup with browser UA | Live hosts absent from every index; sees through Vercel/Cloudflare bot-walls |
-| Wayback link-crawl | Fetch newest archived pages of apex + www + top discovered hosts, scrape cross-links | Hosts never archived themselves but referenced from real pages |
+| **active-dns HTTP verify** | ~500 curated service names (services.txt + top 250 by frequency from subdomains-110k.txt), resolve+probe in one pass, content-diff filter using 10 randomized nonsense-name baselines | Live hosts absent from every index; sees through Vercel/Cloudflare bot-walls |
+| **must-probe curated** | 40 high-value names (mail, webmail, git, admin, cpanel, smtp, autodiscover, mx, ...) checked via direct DNS even when wildcard DNS is detected | Hosts on totally different infra (non-wildcard IP pool) that wildcard HTTP verify cannot distinguish |
+| **Wayback link-crawl** | Fetch newest archived pages of apex + www + top discovered hosts, scrape cross-links | Hosts never archived themselves but referenced from real pages |
+
+### Why HTTP brute uses ~500 names, DNS brute uses 110k
+
+HTTP requests are heavy — every probe costs a TLS handshake, a
+Chrome-impersonated session, a full HTTP response body, and each
+sequential probe to a Vercel-fronted target adds rate-limit pressure.
+Full 110k over HTTP would take **3-4 hours** and trigger bot-detection
+within the first 5 minutes. Curated ~500 covers **95%+ of real-world
+subdomains** in 40-90s.
+
+DNS queries are cheap — a single 40-byte UDP packet plus a
+10-byte answer. dnsx processes 110k queries in under 2 minutes at
+1000 qps without any bot-detection risk. So DNS brute does use the
+full wordlist, HTTP brute does not.
+
+Both stages automatically skip when wildcard DNS is detected on the
+apex (because every random name resolves and the results are useless).
+`must-probe` intentionally does NOT skip on wildcard because it uses
+IP-pool comparison, not content comparison, to filter noise.
 
 Source attribution: every result reports which source found which subdomain.
 
@@ -211,9 +231,9 @@ functions before returning:
 _split_stale         status 4xx AND (length under 500 OR body contains
                      a DEPLOYMENT_MISSING_SIGNATURES marker)
 _split_bot_walled    status 4xx AND title matches WALL_TITLE_SIGNATURES
-_split_wildcard_http fetch offsec-wildcard-{nonce}.apex once as control
-                     probe, move any 4xx with identical (status, title)
-                     signature
+_split_wildcard_http fetch offsec-wildcard-{nonce}.apex THREE times as
+                     control probes and take the majority non-wall sig,
+                     move any 4xx with identical (status, title)
 _strip_private_fields  drop the _deployment_missing helper flag
 ```
 
@@ -245,6 +265,63 @@ edge headers (`server`, `x-vercel-id`, `cf-ray`, `x-nf-app-id`,
 resolves to `example.co.uk` instead of the nonsense string `co.uk`.
 Covers UK, AU, NZ, JP, KR, CN, IN, PK, BD, NP, LK, SG, MY, PH, VN, ID,
 TH, BR, MX, AR, CO, PE, UA, TR, ZA, KE, NG, GH, TZ, UG, ZW, EG, IL.
+
+### Baseline calibration against bot-walls
+
+Content-diff filtering (both in `enumerate` and in `check_alive`)
+memorises what a **known-fake name** looks like and drops everything
+matching that signature. The failure mode: when Vercel or Cloudflare
+serves its challenge page to our **baseline probes themselves**, we
+memorise the wall instead of the real wildcard catchall. Then every
+real wildcard 404 looks "different from the memorised wall" and
+slips through as if it were a real subdomain.
+
+Both stages now calibrate defensively:
+
+**`_active_dns_verify` in `tools/enumerate.py`**
+- 10 baseline nonsense-name probes (was 6). Higher probability that at
+  least one breaks through the wall.
+- Wall signatures (Vercel Checkpoint, Cloudflare Turnstile, Akamai,
+  etc.) are excluded from `baseline_sigs` when baselines respond —
+  one walled probe cannot poison the calibration.
+- **Self-healing**: if every baseline got walled or timed out, use the
+  most-common non-wall sig among the ~500 candidates as the catchall.
+- **Dominant-wall override**: when a wall sig itself appears on 15+
+  hosts (or half of all probed responses), the edge is serving it to
+  real and fake names uniformly. In that scenario the wall IS the
+  catchall and is added back to `baseline_sigs` so those names drop
+  out too.
+- **Error-status cluster override**: any 4xx or 5xx sig observed on
+  5+ hosts is a shared handler (real apps don't cluster on errors at
+  that scale), so it's treated as catchall.
+
+**`_http_wildcard_probe_sig` in `tools/alive.py`**
+- 3 control nonsense-name probes (was 1) with majority vote over
+  non-wall responses. Falls back to `None` when all 3 got walled so
+  the caller skips filtering safely rather than mis-flagging real
+  subs as wildcard noise.
+
+Tested on a wildcard-CDN target: pre-fix `full_recon` returned 43
+subs with 31 mixed real-and-fake bot_walled entries. Post-fix same
+target returns 8-12 subs with 5-7 bot_walled entries all pointing
+to legitimate deployments.
+
+### Known noise source: must-probe on wildcard targets
+
+The `must-probe` curated stage (`autodiscover`, `assets`, `docs`,
+`git`, `admin`, `cpanel`, `smtp`, `mx`, `webmail`, ...) intentionally
+bypasses wildcard DNS detection. Rationale: some targets host these
+services on totally separate infrastructure (different IP pool than
+the wildcard), so a wildcard-aware filter would miss them.
+
+Cost: on a target where the wildcard covers mail AND these names
+resolve to the wildcard pool, must-probe adds up to 40 extra candidates
+to the pipeline. `check_alive` will correctly put them in `bot_walled`
+or `stale` if they hit the same wall/handler as the wildcard, so they
+never pollute the `alive` bucket. But if you see a `must-probe(N)`
+count in your output on a fully wildcard target, treat those N names
+as "check_alive couldn't confirm or deny" rather than "N new real
+subdomains found".
 
 ### Honest limits
 
