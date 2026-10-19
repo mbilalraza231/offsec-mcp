@@ -303,29 +303,51 @@ def _infer_apex(subdomains: list[str]) -> str | None:
     return None
 
 
-def _http_wildcard_probe_sig(apex: str, timeout: int = 5) -> tuple | None:
-    """Fetch a nonsense host on the apex and return (status, title_lower60)
-    if it responds, else None. Uses strict_get so curl_cffi Chrome
-    fingerprint is used (matching the real probes' transport).
+def _http_wildcard_probe_sig(apex: str, timeout: int = 5,
+                             probes: int = 3) -> tuple | None:
+    """Fetch `probes` nonsense hosts on the apex and return the majority
+    non-wall (status, title_lower60) signature.
 
     A wildcard-DNS and wildcard-project target (e.g. example.com on Vercel
     with a catch-all Next.js app) answers ANY random name with an
     identical page. Comparing real subs against this control response
-    separates 'genuinely deployed' from 'just the wildcard handler'."""
+    separates 'genuinely deployed' from 'just the wildcard handler'.
+
+    Multiple probes because a single control probe can get bot-walled
+    intermittently (Vercel Security Checkpoint, Cloudflare Turnstile).
+    When that happens we memorise the wall sig instead of the true
+    catchall sig, and everything looks unique vs the wall baseline. With
+    3 probes we take the majority NON-WALL sig; only fall back to None
+    when all 3 got walled or timed out (in which case the caller skips
+    filtering safely)."""
     import random
     import string
-    nonce = "".join(
-        random.choices(string.ascii_lowercase + string.digits, k=16))
-    probe = f"https://offsec-wildcard-{nonce}.{apex}"
-    try:
-        r = strict_get(probe, timeout=timeout)
-    except Exception:
+    from collections import Counter
+
+    sigs: list[tuple] = []
+    for _ in range(probes):
+        nonce = "".join(
+            random.choices(string.ascii_lowercase + string.digits, k=16))
+        probe = f"https://offsec-wildcard-{nonce}.{apex}"
+        try:
+            r = strict_get(probe, timeout=timeout)
+        except Exception:
+            continue
+        m = re.search(
+            r"<title[^>]*>(.*?)</title>",
+            r.text[:20000], re.I | re.S)
+        title = (m.group(1).strip().lower()[:60]) if m else ""
+        sigs.append((r.status_code, title))
+
+    if not sigs:
         return None
-    m = re.search(
-        r"<title[^>]*>(.*?)</title>",
-        r.text[:20000], re.I | re.S)
-    title = (m.group(1).strip().lower()[:60]) if m else ""
-    return (r.status_code, title)
+    # Prefer non-wall sigs; if all got walled, return None so the caller
+    # skips filtering safely.
+    non_wall = [s for s in sigs if not _looks_like_wall(s[1])]
+    if not non_wall:
+        return None
+    # Majority vote among non-wall responses
+    return Counter(non_wall).most_common(1)[0][0]
 
 
 def _split_wildcard_http(result: dict, subdomains: list[str]) -> dict:

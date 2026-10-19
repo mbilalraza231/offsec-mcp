@@ -802,18 +802,40 @@ def _active_dns_verify(domain: str) -> set[str]:
     this stage. Previously used the Go httpx binary which was fast but
     got wall-blocked intermittently, dropping real hosts like
     shop.example.com from the run-to-run result set.
+
+    Baseline calibration issue (fixed here): on a target behind an
+    aggressive bot-wall, every baseline probe can receive the wall page
+    instead of the real wildcard catchall. Memorising the wall sig is
+    wrong because the wall is served identically to real and fake names
+    downstream. The 404 wildcard catchall then looks unique against the
+    wall baseline and dozens of fake names slip through in one run.
+
+    Mitigations:
+      - 10 baseline probes (was 6) so at least one is likely to break
+        through an intermittent wall
+      - Wall sigs are excluded from baseline_sigs when baselines respond
+        normally, so a single walled probe cannot poison the calibration
+      - Self-healing: if every baseline got walled or timed out, use
+        the dominant non-wall sig among candidates as the catchall
+      - Dominant-wall override: when the wall sig itself appears on 15+
+        hosts (or half of all probed responses), Vercel's edge is serving
+        the challenge to real and fake names uniformly. In that case the
+        wall IS the catchall signature for this run and is added back
+        to baseline_sigs so those names drop out too.
     """
     import random
     import string
     from collections import Counter
+    from tools.alive import WALL_TITLE_SIGNATURES
 
     words = _load_words()
     candidates = [f"{w}.{domain}" for w in words]
 
-    # Baseline probes (random nonsense names) capture the catch-all signature
+    # 10 baseline probes (was 6). Higher chance at least one breaks
+    # the wall and captures the true catchall signature.
     baseline_names = [
         f"{''.join(random.choices(string.ascii_lowercase, k=12))}.{domain}"
-        for _ in range(6)
+        for _ in range(10)
     ]
 
     # One Python pass over baseline + candidates. 25 threads keeps wall
@@ -823,16 +845,69 @@ def _active_dns_verify(domain: str) -> set[str]:
     if not probed:
         return set()
 
-    # Signatures returned by nonsense names = the catch-all noise
-    baseline_sigs = {probed[h] for h in baseline_names if h in probed}
+    def _is_wall(sig):
+        """Bot-challenge pages: 403/429/503 with a challenge title.
+        Served identically to real deployments and wildcard noise, so
+        they can never act as the catchall baseline."""
+        status, title = sig
+        if status not in (403, 429, 503):
+            return False
+        return any(w in (title or "") for w in WALL_TITLE_SIGNATURES)
 
-    # Also treat the dominant cluster as catch-all (robust when baseline
-    # names happen not to respond but the wildcard still serves wordlist hits)
+    # Baseline sigs: only from probes that broke through the wall.
+    baseline_sigs = {
+        probed[h] for h in baseline_names
+        if h in probed and not _is_wall(probed[h])
+    }
+
     sig_counts = Counter(probed.values())
+
+    # Self-healing: if every baseline got walled or timed out, use the
+    # most-common non-wall sig among candidates as the catchall. This
+    # is exactly the case that produced the inflated 40-name active-dns
+    # result on a Vercel wildcard target.
+    if not baseline_sigs:
+        for sig, n in sig_counts.most_common(20):
+            if _is_wall(sig):
+                continue
+            if n >= 5:
+                baseline_sigs.add(sig)
+            break
+
+    # Dominant wall = catchall behind wall.
+    # Vercel's edge pipeline can challenge every request before routing
+    # to the deployment. Both real apps and fake wordlist names then
+    # return the exact same 403 wall page. In that case the wall sig IS
+    # the catchall signature for this run, so we treat it as noise too.
+    # Threshold: wall sig appears on >=15 hosts OR >=50% of probed.
+    # The 15 floor protects small targets where only 3-5 real apps got
+    # challenged (we still want those in the bot_walled bucket).
+    total_probed = len(probed)
+    for sig, n in sig_counts.most_common():
+        if not _is_wall(sig):
+            continue
+        if n >= 15 or (total_probed >= 30 and n >= 0.5 * total_probed):
+            baseline_sigs.add(sig)
+
+    # Legacy dominant-cluster safety net, but only fires when the top
+    # cluster is NOT a wall (walls handled above).
     if sig_counts:
         top_sig, top_n = sig_counts.most_common(1)[0]
-        if top_n >= 0.5 * len(probed) and top_n >= 5:
+        if (not _is_wall(top_sig)
+                and top_n >= 0.5 * len(probed) and top_n >= 5):
             baseline_sigs.add(top_sig)
+
+    # Error-status cluster override.
+    # Any 4xx / 5xx signature observed on 5+ hosts is a shared handler
+    # serving a catch-all page. Real apps occasionally cluster on 200
+    # (e.g. 5 staging boxes with default nginx content) but never on
+    # error statuses in numbers this big without being wildcard noise.
+    # Catches cases like (404, '') from timeouts or bare 404 responses
+    # that don't have the standard Vercel "404: NOT_FOUND" title.
+    for sig, n in sig_counts.most_common(20):
+        status = sig[0]
+        if status and status >= 400 and n >= 5:
+            baseline_sigs.add(sig)
 
     found: set[str] = set()
     for host, sig in probed.items():
@@ -842,6 +917,8 @@ def _active_dns_verify(domain: str) -> set[str]:
             continue
         if sig in baseline_sigs:
             continue  # catch-all page -> wildcard noise, skip
+        # Wall sigs fall through and are kept. Downstream check_alive
+        # places them in the bot_walled bucket honestly.
         found.add(host)
 
     # Include root/apex if it responded with non-noise content
