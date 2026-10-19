@@ -7,6 +7,7 @@ Run:  python server.py
 Serves: http://127.0.0.1:8000/sse
 """
 
+from starlette.responses import JSONResponse
 from storage import save_results as _save, list_scans as _list
 from config import detect_tools
 from tools.takeover import check_takeover as _takeover
@@ -492,6 +493,31 @@ def full_recon(domain: str) -> dict:
     return report
 
 
+# ---------- unauthenticated health endpoint ----------
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health(_request):
+    tool_status = detect_tools()
+    mcp_tools = await mcp.list_tools()
+    return JSONResponse({
+        "status": "ok",
+        "server": "offsec-mcp",
+        "transport": "sse",
+        "endpoints": {
+            "sse": "/sse",
+            "messages": "/messages/",
+            "health": "/health",
+        },
+        "mcp_tool_count": len(mcp_tools),
+        "mcp_tools": sorted(t.name for t in mcp_tools),
+        "external_binaries_installed": sorted(tool_status.get("installed", {})),
+        "external_binaries_missing": sorted(tool_status.get("missing", {})),
+        "bin_dir": tool_status.get("bin_dir"),
+        "platform": tool_status.get("platform"),
+    })
+
+
 if __name__ == "__main__":
     import uvicorn
     from starlette.middleware.cors import CORSMiddleware
@@ -506,4 +532,5 @@ if __name__ == "__main__":
     )
 
     print("[*] offsec-mcp SSE server starting on http://127.0.0.1:8000/sse")
+    print("[*] health check:        http://127.0.0.1:8000/health")
     uvicorn.run(app, host="127.0.0.1", port=8000)

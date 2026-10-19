@@ -1051,16 +1051,6 @@ def _dnsx_brute(domain: str, words: list[str],
 # ---------------------------------------------------------------------------
 # Wildcard pool discovery and curated must-probe (bypass wildcard-skip)
 # ---------------------------------------------------------------------------
-# Problem: on targets like example.com, `*.example.com` is a wildcard A record
-# pointing to Vercel's edge IP pool. Every real Vercel-hosted subdomain
-# (docs, distributorpos) resolves to the SAME 4 IPs as every fake name
-# (wb-randomnonce). DNS alone cannot distinguish them. Our existing
-# `_dnsx_brute` correctly returns `wildcard_skip` here so we don't get
-# 100% false positives from the wordlist. But that also skips real hosts
-# like mail.example.com which have a CNAME to mail.mailprovider.example plus a
-# totally different A record (45.8.227.100). The curated pass below catches
-# those "different infra" hosts cheaply (40 DNS lookups, ~2s) while still
-# leaving the wildcard-noise filtering to the HTTP content-diff stage.
 
 def _discover_wildcard_pool(domain: str,
                             nonces: int = 15) -> tuple[set[str], set[str]]:

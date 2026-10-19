@@ -439,6 +439,12 @@ You'll see:
 INFO:     Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)
 ```
 
+Verify it is alive (open a second PowerShell window):
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/health
+```
+Returns `status: ok` plus the list of 13 MCP tools and which external binaries were detected on your `bin/` directory.
+
 ### 4. Connect LlamaFile
 Open LlamaFile → **Add New MCP Server** → paste:
 ```

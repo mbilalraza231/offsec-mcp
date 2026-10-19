@@ -1,14 +1,5 @@
-"""
-tools/vuln.py - vulnerability scan with nuclei.
-
-No pure-Python fallback - nuclei's template engine is irreplaceable.
-If nuclei is missing, returns a clear message telling the user to install it.
-
-Templates live on the SSD next to the binary (`bin/nuclei-templates/`)
-so the whole setup stays portable. Bootstrap once:
-
-    nuclei -update-templates -ud <ssd>/offsec-mcp/bin/nuclei-templates
-"""
+"""tools/vuln.py - nuclei vulnerability scan. Templates live on the SSD
+at `bin/nuclei-templates/` so the setup stays portable."""
 
 import json
 import subprocess
@@ -18,8 +9,7 @@ from pathlib import Path
 
 from config import BIN_DIR, find_tool
 
-TIMEOUT = 300  # 5 min cap
-
+TIMEOUT = 300
 LOCAL_TEMPLATES_DIR = BIN_DIR / "nuclei-templates"
 
 
@@ -43,9 +33,6 @@ def scan_vulnerabilities(targets: list[str]) -> dict:
         f.write("\n".join(targets))
         target_file = f.name
 
-    # Only pass -t when the SSD template dir actually exists and has
-    # content. Otherwise let nuclei hit its own default and we surface
-    # the exit=2 hint below.
     tmpl_args: list[str] = []
     if LOCAL_TEMPLATES_DIR.exists():
         try:
@@ -81,9 +68,7 @@ def scan_vulnerabilities(targets: list[str]) -> dict:
             "engine": "nuclei",
             "targets_scanned": len(targets),
         }
-        # Exit 2 with no findings = nuclei failed to initialise, almost
-        # always because templates are missing. Exit 0 with no findings
-        # = legit "clean scan". Distinguish them.
+        # exit 2 with no findings = templates missing; exit 0 = clean scan
         if proc.returncode != 0 and not findings:
             if proc.returncode == 2:
                 result["engine_error"] = (

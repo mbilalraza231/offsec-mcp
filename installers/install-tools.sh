@@ -61,13 +61,11 @@ fi
 echo "=== done ==="
 echo "Binaries in: $BIN_DIR"
 
-# Bootstrap nuclei community templates onto the same SSD as the binaries.
-# Without this nuclei runs but exits 2 because it has nothing to check.
-# Keeps the whole setup portable: nothing written to $HOME.
+# Bootstrap nuclei templates onto the SSD so nothing lands on $HOME.
 if [[ -x "$BIN_DIR/nuclei" ]]; then
   TMPL_DIR="$BIN_DIR/nuclei-templates"
   echo ""
-  echo "[nuclei-templates] bootstrapping community template pack onto SSD..."
+  echo "[nuclei-templates] bootstrapping onto SSD..."
   echo "  destination: $TMPL_DIR"
   "$BIN_DIR/nuclei" -update-templates -ud "$TMPL_DIR" \
     && echo "  templates installed -> $TMPL_DIR" \

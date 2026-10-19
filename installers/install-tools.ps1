@@ -64,21 +64,18 @@ foreach ($t in $tools) {
 Write-Host "`n=== done ===" -ForegroundColor Cyan
 Write-Host "Binaries in: $((Resolve-Path $BinDir).Path)"
 
-# Bootstrap nuclei community templates onto the same SSD as the binaries.
-# Without this nuclei runs but exits 2 with no findings because it has
-# nothing to check against. Keeps the whole setup portable: nothing is
-# written to $env:USERPROFILE.
+# Bootstrap nuclei templates onto the SSD so nothing lands on $env:USERPROFILE.
 $nucleiExe = Join-Path $BinDir "nuclei.exe"
 if (Test-Path $nucleiExe) {
     $tmplDir = Join-Path $BinDir "nuclei-templates"
-    Write-Host "`n[nuclei-templates] bootstrapping community template pack onto SSD..." -ForegroundColor Yellow
+    Write-Host "`n[nuclei-templates] bootstrapping onto SSD..." -ForegroundColor Yellow
     Write-Host "  destination: $tmplDir" -ForegroundColor DarkGray
     try {
         & $nucleiExe -update-templates -ud $tmplDir
         if (Test-Path $tmplDir) {
             Write-Host "  templates installed -> $tmplDir" -ForegroundColor Green
         } else {
-            Write-Host "  update-templates ran but directory is empty - rerun this script" -ForegroundColor Red
+            Write-Host "  ran but directory empty - rerun this script" -ForegroundColor Red
         }
     } catch {
         Write-Host "  FAILED: $($_.Exception.Message)" -ForegroundColor Red
