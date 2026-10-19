@@ -1063,7 +1063,7 @@ def _dnsx_brute(domain: str, words: list[str],
 # leaving the wildcard-noise filtering to the HTTP content-diff stage.
 
 def _discover_wildcard_pool(domain: str,
-                            nonces: int = 8) -> tuple[set[str], set[str]]:
+                            nonces: int = 15) -> tuple[set[str], set[str]]:
     """Resolve `nonces` random nonsense names in parallel. Return
     (ip_pool, cname_pool).
 
@@ -1072,6 +1072,14 @@ def _discover_wildcard_pool(domain: str,
     CNAME-based (e.g. *.hosted.io -> CNAME to proxy.hosted.io). The
     curated must-probe below uses these sets as "if it matches this,
     it's just wildcard noise" baselines.
+
+    nonces defaults to 15 because edge CDNs like Vercel rotate 2 IPs
+    per DNS response from a pool of 4+. With only 8 probes there is a
+    ~(1/2)^8 = 0.4% chance any specific edge IP is missed by the pool;
+    when that happens a wildcard-noise name resolves to the missed IP
+    and looks like distinct infra to the strict-overlap filter. At 15
+    probes the miss probability drops to ~(1/2)^15 ~= 3e-5 which is
+    effectively never on real targets.
 
     Parallelised via ThreadPoolExecutor. Sequential dnspython on Windows
     was hitting 50s+ wall per call because each UDP query with a 3-5s
@@ -1121,12 +1129,19 @@ def _curated_must_probe(domain: str, wild_ips: set[str],
     """Resolve CURATED_MUST_PROBE labels in parallel; return hosts that
     look real.
 
-    A candidate is "real" (not wildcard noise) if EITHER:
-      (a) it has a CNAME whose target is NOT in the wildcard CNAME pool
-          -> e.g. mail.example.com CNAMEs to mail.mailprovider.example while the
-             wildcard has no CNAME at all.
-      (b) its A record set contains at least one IP NOT in the wildcard
-          IP pool -> different infrastructure than the catch-all.
+    A candidate is "real" (not wildcard noise) only if it has ZERO
+    overlap with the wildcard pool on both dimensions:
+      (a) its CNAME set shares no target with wild_cnames (or has no
+          CNAME at all when wild_cnames is empty).
+      (b) its A record set contains no IP that's in wild_ips.
+
+    Strict zero-overlap rule matters because edge CDNs like Vercel
+    rotate 2 IPs per response from a pool of 4+. If our nonce probes
+    happened to miss one IP in that pool and a candidate resolves to it,
+    "any IP outside pool" wrongly flags it as distinct infra. The
+    safe rule is: keep only if the candidate looks genuinely
+    different (e.g. mail.example.com -> 45.8.227.100 while wildcard
+    pool is entirely Vercel edge IPs).
 
     If the domain has no wildcard (empty wild_ips and wild_cnames),
     ANY resolution is treated as real because there is no catchall to
@@ -1161,13 +1176,14 @@ def _curated_must_probe(domain: str, wild_ips: set[str],
                 continue
         if not cnames and not ips:
             return None
-        # Test 1: CNAME indicates separate infra
-        if cnames and (no_wildcard or not cnames.issubset(wild_cnames)):
+        if no_wildcard:
             return host
-        # Test 2: A records outside the wildcard pool
-        if ips and (no_wildcard or not ips.issubset(wild_ips)):
-            return host
-        return None
+        # Strict rule: any overlap with wildcard pool = likely catchall noise
+        if cnames and cnames & wild_cnames:
+            return None
+        if ips and ips & wild_ips:
+            return None
+        return host
 
     real: set[str] = set()
     with ThreadPoolExecutor(max_workers=20) as pool:

@@ -306,22 +306,51 @@ subs with 31 mixed real-and-fake bot_walled entries. Post-fix same
 target returns 8-12 subs with 5-7 bot_walled entries all pointing
 to legitimate deployments.
 
-### Known noise source: must-probe on wildcard targets
+### How must-probe avoids wildcard noise
 
 The `must-probe` curated stage (`autodiscover`, `assets`, `docs`,
-`git`, `admin`, `cpanel`, `smtp`, `mx`, `webmail`, ...) intentionally
-bypasses wildcard DNS detection. Rationale: some targets host these
-services on totally separate infrastructure (different IP pool than
-the wildcard), so a wildcard-aware filter would miss them.
+`git`, `admin`, `cpanel`, `smtp`, `mx`, `webmail`, ...) is a
+DNS-only pass designed to catch services that live on totally
+**separate infrastructure** from the wildcard pool. Example: on a
+Vercel-hosted target `*.example.com` returns Vercel edge IPs but
+`mail.example.com` might CNAME to `mail.mailprovider.example` on an
+unrelated IP (e.g. a Roundcube host on `45.8.227.100`). A
+naive wildcard filter would drop that real mail host.
 
-Cost: on a target where the wildcard covers mail AND these names
-resolve to the wildcard pool, must-probe adds up to 40 extra candidates
-to the pipeline. `check_alive` will correctly put them in `bot_walled`
-or `stale` if they hit the same wall/handler as the wildcard, so they
-never pollute the `alive` bucket. But if you see a `must-probe(N)`
-count in your output on a fully wildcard target, treat those N names
-as "check_alive couldn't confirm or deny" rather than "N new real
-subdomains found".
+To make this safe the tool uses **strict zero-overlap rule**:
+
+```
+probe 15 random nonsense names  -> wildcard IP pool and CNAME pool
+                                   (15 probes because edge CDNs
+                                    rotate 2 IPs per response from
+                                    a pool of 4+; more probes =
+                                    better pool coverage)
+
+for each of the 40 must-probe labels:
+    resolve CNAME and A records
+    if any CNAME overlaps wild_cnames -> drop (wildcard noise)
+    if any IP  overlaps wild_ips      -> drop (wildcard noise)
+    otherwise                          -> keep (genuinely different)
+```
+
+The "otherwise keep" branch fires exactly when the name looks like
+real distinct infra. Example with `xinuty.com`:
+
+```
+wild_ips     = {216.198.79.1, .65, 64.29.17.1, .65}   (Vercel pool)
+mail.xinuty.com        -> A [45.8.227.100]  CNAME webmail.rabhost.com
+                         no overlap  -> KEEP   (real Roundcube host)
+api.xinuty.com         -> A [216.198.79.1, 64.29.17.1]  CNAME []
+                         overlaps    -> DROP   (pure wildcard noise)
+autodiscover.xinuty.com-> A [64.29.17.1, .65]           CNAME []
+                         overlaps    -> DROP
+docs.xinuty.com        -> A [216.198.79.65, 64.29.17.1] CNAME []
+                         overlaps    -> DROP
+```
+
+Real-world result on the fixed pipeline: xinuty must-probe returns
+**1 host** (`mail.xinuty.com`) instead of the 10 wildcards and
+non-overlapping fakes the loose check produced earlier.
 
 ### Honest limits
 
