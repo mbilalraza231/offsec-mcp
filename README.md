@@ -366,7 +366,24 @@ which breaks the "runs on your laptop" contract of this MCP server.
 
 ## Install
 
+Everything installs **self-contained on the drive that holds the
+project folder** (SSD / USB / internal disk). No writes to `C:\`
+except Python's own pip cache. Nothing is registered in the system
+PATH. Unplug the drive, plug it into another machine, everything
+still works.
+
+### What gets installed and what each piece is for
+
+| Item | Required? | Purpose | Where it lives |
+|---|---|---|---|
+| Python 3.10 + | yes | Runtime for the MCP server | Your existing install |
+| `curl_cffi` | yes | Chrome TLS fingerprint to survive Vercel and Cloudflare bot-walls | `.venv\Lib\site-packages\` |
+| `subfinder`, `httpx`, `dnsx`, `nuclei`, `amass` binaries | optional but recommended | Faster and more accurate recon than the Python fallbacks | `.\bin\` on the same drive |
+| `nuclei-templates` community pack | needed only for `scan_vulnerabilities` | 5000+ CVE and misconfig signatures nuclei matches against | `.\bin\nuclei-templates\` on the same drive |
+| 11 passive API sources | no | subfinder already wraps them; nothing to install | Free internet APIs |
+
 ### 1. Python dependencies
+
 ```powershell
 cd offsec-mcp
 python -m venv .venv
@@ -374,7 +391,8 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Recon binaries (optional but recommended)
+### 2. Recon binaries and nuclei templates (optional but recommended)
+
 ```powershell
 # Windows
 Set-ExecutionPolicy -Scope Process Bypass -Force
@@ -383,9 +401,34 @@ Set-ExecutionPolicy -Scope Process Bypass -Force
 # Linux / macOS
 bash installers/install-tools.sh
 ```
-Binaries land in `./bin/` — project-local, does not touch system PATH.
 
-Skip this step and the server still works — it uses Python fallbacks + crt.sh.
+The script:
+- downloads the latest stable Windows/Linux/macOS releases of each
+  tool from GitHub
+- extracts each `.exe` (or Linux binary) into `.\bin\`
+- **bootstraps the nuclei template pack into `.\bin\nuclei-templates\`**
+  so scanning works out of the box and nothing lands on the host
+  machine's `C:\Users\<you>\nuclei-templates\`
+
+Binaries land project-local and do **not** touch system PATH.
+
+**Skip step 2 entirely and you can still enumerate, check liveness,
+detect takeovers and harvest JS endpoints** — every tool has a Python
+fallback. Only `scan_vulnerabilities` genuinely needs the `nuclei`
+binary and template pack.
+
+### 2a. Bootstrap nuclei templates manually (only if step 2 was skipped)
+
+```powershell
+# Windows
+.\bin\nuclei.exe -update-templates -ud .\bin\nuclei-templates
+
+# Linux / macOS
+./bin/nuclei -update-templates -ud ./bin/nuclei-templates
+```
+
+Takes ~30-60s. After this `full_recon` returns real CVE findings
+instead of `nuclei exit=2 with no templates`.
 
 ### 3. Run the MCP server
 ```powershell
