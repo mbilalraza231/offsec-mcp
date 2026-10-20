@@ -278,7 +278,8 @@ def harvest_javascript(urls: list[str], domain: str | None = None,
     # Drop per-session CSRF/challenge tokens that our loose
     # `generic_secret_assignment` regex catches on webmail/login pages.
     # Filter refetches each source once & keeps only stable values.
-    stable_secrets = _filter_stable_secrets(secrets, timeout=timeout)
+    stable_secrets, dropped_secrets = _filter_stable_secrets(
+        secrets, timeout=timeout)
 
     return {
         "sites_scanned": len(per_site),
@@ -286,8 +287,16 @@ def harvest_javascript(urls: list[str], domain: str | None = None,
         "subdomains_found": sorted(unique_hosts),
         "endpoints_found": sorted(unique_endpoints)[:500],
         "secrets_suspected": stable_secrets[:50],
-        "secrets_dropped_as_session_tokens": max(
-            0, len(secrets) - len(stable_secrets)),
+        "secrets_dropped_as_session_tokens": len(dropped_secrets),
+        "dropped_secrets_preview": [
+            {
+                "kind": d["kind"],
+                "value_preview": d["value_preview"],
+                "found_in": d["found_in"],
+                "reason": "unstable across refetch (session token)",
+            }
+            for d in dropped_secrets[:20]
+        ],
         "sites_skipped_bot_walled": len(skipped_bot_walled),
         "skipped_details": skipped_bot_walled[:20],
         "per_site": per_site,
@@ -348,25 +357,21 @@ def _extract_all(text: str, source: str,
             })
 
 
-def _filter_stable_secrets(secrets: list[dict], timeout: int = 8) -> list[dict]:
-    """Drop per-session tokens by refetching each source URL once.
+def _filter_stable_secrets(
+    secrets: list[dict], timeout: int = 8
+) -> tuple[list[dict], list[dict]]:
+    """Refetch each source once & split into (survivors, dropped).
 
-    Problem: our `generic_secret_assignment` regex happily matches the
-    CSRF / challenge token on Roundcube / cPanel / WordPress login pages
-    (e.g. mail.example.com returns `<input name="challengeToken" value=
-    "KPInHXZtsk5Z...">` on every request with a NEW random value). Those
-    are NOT leaked credentials - they're normal session state.
+    The `generic_secret_assignment` regex catches webmail/login page
+    CSRF challenge tokens (Roundcube / cPanel / WordPress) that change
+    on every HTTP request. Those are session state, not leaks.
 
-    Method: for every candidate secret, refetch `found_in` URL. If the
-    exact raw value still appears in the response, it's stable across
-    requests => treat as real leak. If it's gone or changed => session
-    token => discard.
-
-    Cost: 1 extra HTTP GET per source URL that produced a hit. Bounded
-    by the fact that most sites have 0-2 candidates.
+    For each candidate, refetch `found_in`. If raw_value is still there
+    => stable => real leak => survivor. If gone or changed => session
+    token => dropped. Refetch failure => keep as survivor conservatively.
     """
     if not secrets:
-        return []
+        return [], []
 
     from collections import defaultdict
     by_source: dict[str, list[dict]] = defaultdict(list)
@@ -374,6 +379,7 @@ def _filter_stable_secrets(secrets: list[dict], timeout: int = 8) -> list[dict]:
         by_source[s["found_in"]].append(s)
 
     survivors: list[dict] = []
+    dropped: list[dict] = []
     for source, items in by_source.items():
         try:
             r = _get(source, timeout=timeout)
@@ -382,18 +388,15 @@ def _filter_stable_secrets(secrets: list[dict], timeout: int = 8) -> list[dict]:
             fresh = None
 
         if fresh is None:
-            # Cannot verify stability - keep conservatively. Better to
-            # show a possible false positive than to silently drop a
-            # real leak because the refetch failed (e.g. rate-limited).
             survivors.extend(items)
             continue
 
         for s in items:
             if s.get("raw_value") and s["raw_value"] in fresh:
                 survivors.append(s)
-            # else: value not stable => session token => drop
+            else:
+                dropped.append(s)
 
-    # Strip raw_value from output before returning to caller
-    for s in survivors:
+    for s in survivors + dropped:
         s.pop("raw_value", None)
-    return survivors
+    return survivors, dropped
