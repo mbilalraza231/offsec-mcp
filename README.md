@@ -450,7 +450,16 @@ Open LlamaFile → **Add New MCP Server** → paste:
 ```
 http://127.0.0.1:8000/sse
 ```
-Click **Add**. The 9 tools above appear in the tool list.
+Click **Add**. The 13 tools above appear in the tool list.
+
+**⚠ Raise the MCP tool timeout before scanning big targets.** LlamaFile's
+default "Timeout for individual MCP tool calls" is 300s. On a target with
+**no wildcard DNS** (e.g. most bug-bounty scopes) `enumerate_subdomains`
+runs the full 110k-label dnsx sweep and can take **5-8 minutes** end-to-end.
+Bump the timeout to **900s** in LlamaFile Settings → MCP → timeout field
+beforehand, or you'll get `MCP error -32001: Request timed out` and no
+results. Wildcard targets (Vercel / Netlify / CloudFront catch-all) finish
+in 30-60s and need no change.
 
 ## Demo prompts
 
